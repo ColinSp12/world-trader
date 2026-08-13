@@ -1,0 +1,77 @@
+# World Trader — autopilot paper-trading sandbox
+
+An experimental, **local-only, paper-money** trading bot that turns
+[worldmonitor.app](https://worldmonitor.app) world-event data into fully
+specified trades — entry, stop-loss, profit target, position size, time exit —
+and then **opens and manages the simulated positions itself**. You watch; it
+trades. No real money, no broker connection — TradingView has no public order
+API, so all fills are simulated locally.
+
+## Autopilot
+
+Every minute the engine:
+
+1. **Prices queued signals into plans** — entry at the live quote; stop at
+   ~1.5× the symbol's 5-day average daily range (clamped 1.5–8%); target at 2×
+   the stop distance (2R); size risking 1% of equity at the stop (halved when
+   VIX ≥ 30), capped at 15% of equity per position.
+2. **Enters** long/short signals automatically (max 8 open positions, one per
+   symbol, signals fresher than 24h). `watch`-grade signals are suggestions
+   only and are never auto-traded.
+3. **Exits** on stop hit, target hit, or the rule's time horizon (3–5 days).
+
+Everything it does is written to the activity feed on the Trades page, and the
+Pause button stops entries/exits at any time. Paper account starts at $100,000
+(delete `data.db` to reset).
+
+## Run it
+
+```
+start.cmd
+```
+
+(or `C:\Users\colin\tools\node\node.exe server.mjs`) then open <http://localhost:3555>.
+
+## Pages
+
+- **Map** (`/`) — Leaflet world map of live unrest, conflict, earthquake, and
+  natural-disaster events from the WorldMonitor public API, plus their scored
+  news digest and the current signal queue. worldmonitor.app itself refuses
+  iframe embedding, so the map renders their API data directly (button in the
+  sidebar opens the real site).
+- **Trades** (`/trades`) — signal queue → TradingView chart (free embed
+  widget) → one-click paper trade ticket → blotter with live unrealized /
+  realized P&L (Yahoo Finance quotes, Binance fallback for crypto).
+
+## How signals work (`server.mjs`, `deriveSignals` / `deriveNewsSignals`)
+
+Transparent heuristics, deduped per situation per day, stored in SQLite:
+
+| Rule | Trigger | Idea |
+|---|---|---|
+| `quake-country-etf` | M≥5.5 quake in a country with a liquid ETF | short-term weakness in the country ETF |
+| `oil-producer-unrest` | severe unrest in an oil-producing country | long USO / XLE |
+| `chokepoint-disruption` | severe unrest near a shipping chokepoint | long FRO / ZIM / USO |
+| `hurricane-energy` | hurricane-strength Atlantic/EP storm | long UNG / USO, watch insurers |
+| `global-risk-off` | ≥10 severe unrest events in 24h | long GLD, watch VIXY |
+| `headline-risk` | high-threat news, importance ≥55 | watch the story's tickers or sector proxies |
+
+Edit the rules in `server.mjs` — they are ~80 lines of plain JS and meant to be
+tinkered with.
+
+## Data sources
+
+- Events/news: WorldMonitor public endpoints (no key; their middleware requires
+  a ≥10-char non-bot User-Agent; limit 600 req/min — we make ~5 per 5 minutes).
+  Optional: set `WM_API_KEY` env var to unlock keyed endpoints (paid tiers).
+- Quotes: Yahoo Finance v8 chart endpoint (query1 → query2 mirror), Binance for
+  `XXX-USD` crypto. Quotes cache for 60s; last-good is served stale if all fail.
+
+## Files
+
+- `server.mjs` — zero-dependency Node 24 server: static hosting, feed
+  aggregation + normalization, signal engine, quote proxy, SQLite paper blotter
+  (`data.db`, created on first run — delete it to reset the account).
+- `public/` — the two pages; no build step, plain ES modules.
+
+**Not financial advice. Paper trading only.**

@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>World Trader — Trades</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🌍</text></svg>">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand"><span class="globe">🌍</span>World Trader</span>
+  <span class="paper-badge">PAPER TRADING — NO REAL MONEY</span>
+  <nav class="pages">
+    <a href="/">Map</a>
+    <a href="/trades" class="active">Trades</a>
+  </nav>
+  <span class="status" id="status"></span>
+</header>
+<div class="tickerbar">
+  <div class="tradingview-widget-container">
+    <div class="tradingview-widget-container__widget"></div>
+    <div class="tradingview-widget-copyright" style="font-size:11px;padding:1px 8px"><a href="https://www.tradingview.com/markets/" rel="noopener nofollow" target="_blank">Ticker tape by TradingView</a></div>
+    <script type="text/javascript" src="https://s3.tradingview.com/external-embedding/embed-widget-ticker-tape.js" async>
+    {
+      "symbols": [
+        {"proName": "FOREXCOM:SPXUSD", "title": "S&P 500"},
+        {"proName": "TVC:USOIL", "title": "Crude Oil"},
+        {"proName": "TVC:GOLD", "title": "Gold"},
+        {"proName": "TVC:VIX", "title": "VIX"},
+        {"proName": "AMEX:XLE", "title": "Energy"},
+        {"proName": "BITSTAMP:BTCUSD", "title": "BTC/USD"}
+      ],
+      "showSymbolLogo": true,
+      "colorTheme": "dark",
+      "isTransparent": true,
+      "displayMode": "adaptive",
+      "locale": "en"
+    }
+    </script>
+  </div>
+</div>
+<main class="trades">
+  <div class="tiles" id="tiles"></div>
+
+  <section class="panel" id="signals-panel">
+    <h2>Suggested trades <span class="count" id="sig-count"></span></h2>
+    <div class="scroll" id="signals"></div>
+    <div class="note">The autopilot prices each signal into a plan (entry · stop · target · size · time exit), then opens and manages the paper trades itself. Experimental heuristics — not financial advice.</div>
+  </section>
+
+  <section class="panel" id="chart-panel">
+    <div class="chart-head">
+      <strong id="chart-symbol">USO</strong>
+      <input type="text" id="symbol-input" placeholder="symbol…" size="7">
+      <button class="btn" id="load-symbol">Chart</button>
+      <span style="flex:1"></span>
+      <details id="manual-ticket">
+        <summary>Manual trade</summary>
+        <div class="ticket">
+          <label>Side
+            <select id="ticket-side"><option value="long">Long</option><option value="short">Short</option></select>
+          </label>
+          <label>Qty <input type="number" id="ticket-qty" value="100" min="1" step="1"></label>
+          <label>Entry <input type="number" id="ticket-entry" placeholder="market" step="0.01"></label>
+          <label>Stop <input type="number" id="ticket-stop" placeholder="none" step="0.01"></label>
+          <label>Target <input type="number" id="ticket-target" placeholder="none" step="0.01"></label>
+          <button class="btn primary" id="place-trade">Place paper trade</button>
+        </div>
+      </details>
+    </div>
+    <div id="tv-chart"></div>
+  </section>
+
+  <section class="panel" id="blotter-panel">
+    <h2>Positions &amp; history</h2>
+    <div class="scroll" id="blotter"></div>
+  </section>
+
+  <section class="panel" id="activity-panel">
+    <h2>Autopilot activity</h2>
+    <div class="scroll" id="activity"></div>
+  </section>
+</main>
+<script type="module" src="/trades.js"></script>
+</body>
+</html>

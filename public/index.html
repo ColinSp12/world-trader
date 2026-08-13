@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>World Trader — Map</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🌍</text></svg>">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand"><span class="globe">🌍</span>World Trader</span>
+  <span class="paper-badge">PAPER TRADING — NO REAL MONEY</span>
+  <nav class="pages">
+    <a href="/" class="active">Map</a>
+    <a href="/trades">Trades</a>
+  </nav>
+  <span class="status" id="status">loading…</span>
+</header>
+<div class="tickerbar">
+  <div class="tradingview-widget-container">
+    <div class="tradingview-widget-container__widget"></div>
+    <div class="tradingview-widget-copyright" style="font-size:11px;padding:1px 8px"><a href="https://www.tradingview.com/markets/" rel="noopener nofollow" target="_blank">Ticker tape by TradingView</a></div>
+    <script type="text/javascript" src="https://s3.tradingview.com/external-embedding/embed-widget-ticker-tape.js" async>
+    {
+      "symbols": [
+        {"proName": "FOREXCOM:SPXUSD", "title": "S&P 500"},
+        {"proName": "FOREXCOM:NSXUSD", "title": "US 100"},
+        {"proName": "TVC:USOIL", "title": "Crude Oil"},
+        {"proName": "TVC:GOLD", "title": "Gold"},
+        {"proName": "TVC:VIX", "title": "VIX"},
+        {"proName": "AMEX:XLE", "title": "Energy"},
+        {"proName": "BITSTAMP:BTCUSD", "title": "BTC/USD"}
+      ],
+      "showSymbolLogo": true,
+      "colorTheme": "dark",
+      "isTransparent": true,
+      "displayMode": "adaptive",
+      "locale": "en"
+    }
+    </script>
+  </div>
+</div>
+<main class="split">
+  <div id="map"></div>
+  <aside class="side">
+    <div class="half">
+      <h2>Trade signals</h2>
+      <div class="scroll" id="signals"></div>
+    </div>
+    <div class="half">
+      <h2>Live feed
+        <span class="tabbtns">
+          <button id="tab-events" class="active">Events <span id="event-count"></span></button>
+          <button id="tab-news">News</button>
+        </span>
+      </h2>
+      <div class="scroll" id="events"></div>
+      <div class="scroll" id="news" hidden></div>
+    </div>
+    <div class="note">
+      Event data from the <a href="https://worldmonitor.app" target="_blank" rel="noopener">worldmonitor.app</a> public API
+      (the site itself blocks iframe embedding, so this map renders its data directly).
+      Signals are experimental heuristics for paper trading — not financial advice.
+    </div>
+  </aside>
+</main>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script type="module" src="/map.js"></script>
+</body>
+</html>
