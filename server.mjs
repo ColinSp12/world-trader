@@ -1349,9 +1349,10 @@ const server = http.createServer(async (req, res) => {
           if (pnl != null) unrealized += pnl;
         }
         curve.push({ ts: Date.now(), balance: bal + unrealized });
-        // Hyperactive strategies produce thousands of curve points — downsample.
-        if (curve.length > 400) {
-          const step = Math.ceil(curve.length / 400);
+        // Hyperactive strategies produce thousands of curve points — downsample
+        // (cap high enough that client-side range filtering keeps resolution).
+        if (curve.length > 2000) {
+          const step = Math.ceil(curve.length / 2000);
           const sampled = curve.filter((_, i) => i % step === 0);
           if (sampled[sampled.length - 1] !== curve[curve.length - 1]) sampled.push(curve[curve.length - 1]);
           curve.length = 0;
