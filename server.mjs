@@ -40,7 +40,8 @@ const EVENT_REFRESH_MS = 5 * 60 * 1000;
 const QUOTE_TTL_MS = 60 * 1000;
 
 // ---------------------------------------------------------------- database
-const db = new DatabaseSync(path.join(ROOT, 'data.db'));
+// DB_PATH override lets the test suite run against a throwaway database.
+const db = new DatabaseSync(process.env.DB_PATH || path.join(ROOT, 'data.db'));
 db.exec(`
   PRAGMA journal_mode = WAL;
   CREATE TABLE IF NOT EXISTS trades (
