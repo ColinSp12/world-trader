@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>World Trader — Backtest</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🌍</text></svg>">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand"><span class="globe">🌍</span>World Trader</span>
+  <span class="paper-badge">PAPER TRADING — NO REAL MONEY</span>
+  <nav class="pages">
+    <a href="/">Map</a>
+    <a href="/trades">Trades</a>
+    <a href="/strategies">Strategies</a>
+    <a href="/backtest" class="active">Backtest</a>
+  </nav>
+  <span class="status" id="status"></span>
+  <button class="btn small" id="compact-toggle" title="toggle density">▤</button>
+</header>
+<main class="backtest">
+  <section class="panel" id="bt-form-panel">
+    <h2>Run a backtest</h2>
+    <div class="bt-form">
+      <label class="set-field">Mode
+        <select id="bt-mode">
+          <option value="technical">Technical rules over history</option>
+          <option value="signals">Replay recorded live signals</option>
+        </select>
+      </label>
+      <fieldset class="bt-rules" id="bt-rules">
+        <legend>Rules</legend>
+        <label><input type="checkbox" value="ma-cross" checked> EMA 5/20 cross</label>
+        <label><input type="checkbox" value="rsi-reversal" checked> RSI(2) reversal</label>
+        <label><input type="checkbox" value="breakout-20" checked> 20-day breakout</label>
+      </fieldset>
+      <label class="set-field">Exit style
+        <select id="bt-variant">
+          <option value="tight">tight — 0.6×ADR stop · 1R target</option>
+          <option value="base" selected>base — 1×ADR stop · 1.5R target</option>
+          <option value="runner">runner — 1.4×ADR stop · 2R target</option>
+        </select>
+      </label>
+      <label class="set-field">History
+        <select id="bt-range">
+          <option value="180">6 months</option>
+          <option value="365" selected>1 year</option>
+          <option value="730">2 years</option>
+        </select>
+      </label>
+      <label class="set-field">Symbols <span class="dim-note">(blank = the 12-ETF universe)</span>
+        <input type="text" id="bt-symbols" placeholder="SPY, QQQ, USO…">
+      </label>
+      <label class="set-field bt-check"><input type="checkbox" id="bt-friction" checked>
+        Realistic costs <span class="dim-note">(spread + slippage on every fill)</span>
+      </label>
+      <label class="set-field">Label <span class="dim-note">(optional, for the history list)</span>
+        <input type="text" id="bt-label" placeholder="e.g. rsi only, 2y, tight">
+      </label>
+      <button class="btn primary" id="bt-run">▶ Run backtest</button>
+      <div class="note">Entries fill at the NEXT day's open after a signal — never the signal close. Gaps through stops fill at the open; targets fill like resting limit orders; when a stop and target share one bar, the stop is assumed first (conservative). Sizing mirrors the live autopilot: 1% risk, 15% notional cap, $100k per rule.</div>
+    </div>
+    <h2 style="margin-top:14px">History</h2>
+    <div class="scroll" id="bt-history" style="max-height:220px"></div>
+  </section>
+  <section class="panel" id="bt-results-panel">
+    <h2 id="bt-results-title">Results</h2>
+    <div id="bt-results">
+      <div class="empty">Configure a backtest on the left and press Run. Technical mode replays the price-action rules over up to two years of daily bars; signals mode replays every world-event signal this server has recorded (that dataset grows daily).</div>
+    </div>
+  </section>
+</main>
+<script type="module" src="/backtest.js"></script>
+</body>
+</html>

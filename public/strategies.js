@@ -1,6 +1,86 @@
-import { el, api, fmtPnl, renderTradeLogList } from '/shared.js';
+import { el, api, fmtPnl, famDot, renderTradeLogList } from '/shared.js';
 
 const moneyFmt = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
+
+// Fixed categorical palette for the compare overlay (never cycled).
+const COMPARE_COLORS = ['#3987e5', '#d95926', '#199e70', '#9085e9', '#d0a215', '#c65f9c'];
+
+// ---- compare view: normalized % overlay + sortable leaderboard ----
+let leaderSort = 'pnl';
+function compareOverlay(accounts, base) {
+  const active = accounts.filter((a) => !a.watchOnly && a.curve.length >= 2);
+  const top = [...active].sort((x, y) => Math.abs(y.balance - base) - Math.abs(x.balance - base)).slice(0, 6);
+  if (top.length < 2) return null;
+  const w = 900, h = 190, padL = 46, padR = 92, padT = 10, padB = 20;
+  const NS = 'http://www.w3.org/2000/svg';
+  const mk = (tag, attrs, text) => {
+    const n = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, v);
+    if (text != null) n.textContent = text;
+    return n;
+  };
+  const minX = Math.min(...top.map((a) => a.curve[0].ts));
+  const maxX = Date.now();
+  const pct = (b) => ((b - base) / base) * 100;
+  let minY = 0, maxY = 0;
+  for (const a of top) for (const p of a.curve) { minY = Math.min(minY, pct(p.balance)); maxY = Math.max(maxY, pct(p.balance)); }
+  const span = Math.max(maxY - minY, 0.1);
+  minY -= span * 0.1; maxY += span * 0.1;
+  const X = (t) => padL + ((t - minX) / (maxX - minX || 1)) * (w - padL - padR);
+  const Y = (v) => padT + ((maxY - v) / (maxY - minY)) * (h - padT - padB);
+  const svg = mk('svg', { viewBox: `0 0 ${w} ${h}`, class: 'equity-chart', role: 'img', 'aria-label': 'strategy return comparison' });
+  svg.append(mk('line', { x1: padL, x2: w - padR, y1: Y(0), y2: Y(0), stroke: 'var(--muted)', 'stroke-dasharray': '4,4', opacity: 0.5, 'stroke-width': 1 }));
+  svg.append(mk('text', { x: padL - 5, y: Y(0) + 4, 'text-anchor': 'end', fill: 'var(--muted)', 'font-size': 10.5 }, '0%'));
+  for (const v of [minY + span * 0.1, maxY - span * 0.1]) {
+    svg.append(mk('text', { x: padL - 5, y: Y(v) + 4, 'text-anchor': 'end', fill: 'var(--muted)', 'font-size': 10.5 }, `${v >= 0 ? '+' : ''}${v.toFixed(2)}%`));
+  }
+  top.forEach((a, i) => {
+    const color = COMPARE_COLORS[i % COMPARE_COLORS.length];
+    const pts = [...a.curve.map((p) => `${X(p.ts).toFixed(1)},${Y(pct(p.balance)).toFixed(1)}`),
+      `${X(maxX).toFixed(1)},${Y(pct(a.balance)).toFixed(1)}`].join(' ');
+    svg.append(mk('polyline', { points: pts, fill: 'none', stroke: color, 'stroke-width': 1.8, 'stroke-linejoin': 'round', opacity: 0.9 }));
+    svg.append(mk('circle', { cx: X(maxX), cy: Y(pct(a.balance)), r: 2.5, fill: color }));
+    svg.append(mk('text', { x: X(maxX) + 5, y: Y(pct(a.balance)) + 3.5, fill: color, 'font-size': 10.5 },
+      `${a.title.length > 14 ? a.title.slice(0, 13) + '…' : a.title} ${pct(a.balance) >= 0 ? '+' : ''}${pct(a.balance).toFixed(2)}%`));
+  });
+  return el('div', { class: 'panel' },
+    el('h2', {}, 'Head to head — % return on $100k'),
+    svg,
+    el('div', { class: 'dim-note' }, 'Top movers overlaid on one % scale — the honest comparison the individual cards cannot give you.'));
+}
+
+function leaderboard(accounts, base, perf) {
+  const rows = accounts.filter((a) => !a.watchOnly);
+  const dd = perf?.drawdowns || {};
+  const sorters = {
+    pnl: (x, y) => (y.balance - base) - (x.balance - base),
+    win: (x, y) => (y.winRate ?? -1) - (x.winRate ?? -1),
+    trades: (x, y) => (y.closedCount + y.openCount) - (x.closedCount + x.openCount),
+    dd: (x, y) => (dd[x.rule] ?? 0) - (dd[y.rule] ?? 0),
+  };
+  rows.sort(sorters[leaderSort] || sorters.pnl);
+  const head = (label, key) => el('th', {
+    class: leaderSort === key ? 'sortable active' : 'sortable',
+    role: 'button', tabindex: 0,
+    onclick: () => { leaderSort = key; route(); },
+  }, label + (leaderSort === key ? ' ↓' : ''));
+  return el('div', { class: 'panel' },
+    el('h2', {}, 'Leaderboard'),
+    el('div', { style: 'overflow-x:auto' }, el('table', { class: 'mini-table' },
+      el('thead', {}, el('tr', {},
+        el('th', {}, '#'), el('th', { style: 'text-align:left' }, 'Strategy'),
+        head('P&L', 'pnl'), head('Win rate', 'win'), head('Trades', 'trades'), head('Max DD', 'dd'))),
+      el('tbody', {}, ...rows.map((a, i) => {
+        const delta = a.balance - base;
+        return el('tr', { class: 'clickable', onclick: () => { location.hash = a.rule; } },
+          el('td', {}, String(i + 1)),
+          el('td', { style: 'text-align:left' }, famDot(a.rule), ` ${a.title}`),
+          el('td', { class: delta > 0 ? 'pnl-up' : delta < 0 ? 'pnl-down' : '' }, fmtPnl(delta)),
+          el('td', {}, a.winRate != null ? `${Math.round(a.winRate * 100)}% (n=${a.closedCount})` : '—'),
+          el('td', {}, String(a.closedCount + a.openCount)),
+          el('td', { class: dd[a.rule] < 0 ? 'pnl-down' : '' }, dd[a.rule] != null ? fmtPnl(dd[a.rule]) : '—'));
+      })))));
+}
 
 // Balance-over-time mini chart with the $100k base as a dashed reference line.
 function balanceCurve(curve, base, w = 300, h = 84) {
@@ -35,7 +115,12 @@ function balanceCurve(curve, base, w = 300, h = 84) {
 
 function card(a, base) {
   const delta = a.balance - base;
-  return el('div', { class: `strategy-card clickable fam-border-${a.family}`, onclick: () => { location.hash = a.rule; } },
+  return el('div', {
+    class: `strategy-card clickable fam-border-${a.family}`,
+    role: 'button', tabindex: 0, 'aria-label': `open ${a.title} detail`,
+    onclick: () => { location.hash = a.rule; },
+    onkeydown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); location.hash = a.rule; } },
+  },
     el('div', { class: 'head' },
       el('h3', {}, a.title),
       a.watchOnly ? el('span', { class: 'chip' }, 'watch-only') : el('span', { class: 'chip auto' }, 'auto-trades'),
@@ -48,7 +133,7 @@ function card(a, base) {
     el('div', { class: 'stats' },
       [`${a.closedCount + a.openCount} trade${a.closedCount + a.openCount === 1 ? '' : 's'}`,
         a.openCount ? `${a.openCount} open` : null,
-        a.winRate != null ? `${Math.round(a.winRate * 100)}% win` : null,
+        a.winRate != null ? `${Math.round(a.winRate * 100)}% win (n=${a.closedCount})` : null,
       ].filter(Boolean).join(' · ') || 'no trades yet',
     ),
     el('p', { class: 'desc' }, a.description),
@@ -82,7 +167,7 @@ function rangedCurve(curve, rangeMs) {
 
 const fmtWhen = (t) => new Date(t).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 
-function detailCurve(curve, base, onHover, onLeave) {
+function detailCurve(curve, base, onHover, onLeave, benchmark = null, markers = []) {
   const w = 900, h = 230, padL = 62, padR = 14, padT = 14, padB = 24;
   const NS = 'http://www.w3.org/2000/svg';
   const mk = (tag, attrs, text) => {
@@ -109,6 +194,27 @@ function detailCurve(curve, base, onHover, onLeave) {
   const last = curve[curve.length - 1].balance;
   const first = curve[0].balance;
   const color = last > first ? 'var(--up)' : last < first ? 'var(--down)' : 'var(--accent)';
+  // SPY buy-and-hold benchmark, rebased to the window's starting balance —
+  // the "what if we did nothing" line.
+  if (benchmark?.length >= 2) {
+    const inWin = benchmark.filter((p) => p.ts >= minX - 86400e3 && p.ts <= maxX);
+    if (inWin.length >= 2) {
+      const scale = first / inWin[0].balance;
+      const clampY = (v) => Math.min(Math.max(v, minY), maxY);
+      const bPts = inWin.map((p) => `${X(Math.max(p.ts, minX)).toFixed(1)},${Y(clampY(p.balance * scale)).toFixed(1)}`).join(' ');
+      svg.append(mk('polyline', { points: bPts, fill: 'none', stroke: 'var(--muted)', 'stroke-width': 1.4, 'stroke-dasharray': '5,4', opacity: 0.75 }));
+      const bl = inWin[inWin.length - 1];
+      svg.append(mk('text', { x: X(bl.ts) - 4, y: Y(clampY(bl.balance * scale)) - 5, 'text-anchor': 'end', fill: 'var(--muted)', 'font-size': 10.5 }, 'SPY'));
+    }
+  }
+  // Evolution moments: violet markers where a new generation went live.
+  for (const m of markers) {
+    if (m.ts < minX || m.ts > maxX) continue;
+    svg.append(mk('line', { x1: X(m.ts), x2: X(m.ts), y1: padT, y2: h - padB, stroke: 'var(--hyper, #9085e9)', 'stroke-width': 1, opacity: 0.5, 'stroke-dasharray': '2,3' }));
+    const tri = mk('path', { d: `M ${X(m.ts) - 4} ${h - padB} L ${X(m.ts) + 4} ${h - padB} L ${X(m.ts)} ${h - padB - 7} Z`, fill: 'var(--hyper, #9085e9)' });
+    tri.append(mk('title', {}, m.label));
+    svg.append(tri);
+  }
   const linePts = curve.map((p) => `${X(p.ts).toFixed(1)},${Y(p.balance).toFixed(1)}`).join(' ');
   svg.append(mk('polygon', { points: `${X(minX).toFixed(1)},${Y(minY)} ${linePts} ${X(maxX).toFixed(1)},${Y(minY)}`, fill: color, opacity: 0.07 }));
   svg.append(mk('polyline', { points: linePts, fill: 'none', stroke: color, 'stroke-width': 2, 'stroke-linejoin': 'round' }));
@@ -180,12 +286,17 @@ async function renderDetail(a, base) {
       class: key === detailRange ? 'active' : '',
       onclick: () => { detailRange = key; renderDetail(a, base); },
     }, key)));
+  // Generation-activation markers on the curve — connect "the engine changed
+  // parameters" to "the curve changed shape".
+  const genMarkers = (evoCache?.generations || [])
+    .filter((g) => g.rule === a.rule && g.activated_at)
+    .map((g) => ({ ts: g.activated_at, label: `gen ${g.gen} activated — ${(g.note || '').slice(0, 120)}` }));
   const chartCard = el('div', { class: 'panel chart-card' },
     el('div', { class: 'chart-card-head' },
       el('div', {}, valEl, deltaEl),
       pills,
     ),
-    detailCurve(windowed, base, onHover, onLeave),
+    detailCurve(windowed, base, onHover, onLeave, benchCache, genMarkers),
   );
 
   const mainCol = el('div', { class: 'detail-main' },
@@ -230,6 +341,14 @@ async function renderDetail(a, base) {
       el('div', { class: 'dim-note' }, `🧠 learned tuning: stop×${tune.stop_mult.toFixed(2)} · target×${tune.target_mult.toFixed(2)} — ${tune.note || ''}`)));
   }
 
+  // This strategy's own daily P&L calendar + its slice of the learning log.
+  try {
+    const daily = await api(`/api/daily-pnl?rule=${encodeURIComponent(a.rule)}`);
+    if (daily.days?.length) mainCol.append(heatmap(daily.days, `Daily P&L — ${a.title}`));
+  } catch { /* calendar is optional */ }
+  const myLog = (evoCache?.log || []).filter((l) => l.message.includes(a.rule)).slice(0, 12);
+  if (myLog.length) mainCol.append(learningLog(myLog, `🧠 Learning log — ${a.title}`));
+
   const tapeBox = el('div', { class: 'scroll' });
   const tape = el('section', { class: 'panel detail-tape' },
     el('h2', {}, 'Live fills'),
@@ -239,21 +358,30 @@ async function renderDetail(a, base) {
 
   try {
     const trades = await strategyTrades(a.rule);
-    renderTradeLogList(tapeBox, trades, 200);
+    // flashKey keeps new-fill flashes working across re-renders (the tape box
+    // element is recreated every render, so a WeakMap key would never match).
+    renderTradeLogList(tapeBox, trades, 200, `tape-${a.rule}`);
   } catch {
     tapeBox.append(el('div', { class: 'empty' }, 'Fills unavailable right now.'));
   }
 }
 
 // ---- daily P&L calendar heatmap (GitHub-style) ----
-function heatmap(days) {
+function heatmap(days, title = 'Daily P&L — last 12 weeks') {
   const byDay = new Map(days.map((d) => [d.day, d]));
   const maxAbs = Math.max(1, ...days.map((d) => Math.abs(d.pnl)));
   const grid = el('div', { class: 'heatmap' });
+  const monthRow = el('div', { class: 'hm-months' });
   // Step in UTC epoch days — the server buckets /api/daily-pnl by UTC day, and
   // local-time stepping duplicates/skips a day when the window spans a DST shift.
   const todayUtc = Math.floor(Date.now() / 86400000);
+  let lastMonth = '';
   for (let w = 11; w >= 0; w--) {
+    // Month label above the column where a new month starts.
+    const colTop = new Date((todayUtc - (w * 7 + 6)) * 86400000);
+    const mLabel = colTop.toLocaleString(undefined, { month: 'short' });
+    monthRow.append(el('span', { class: 'hm-month' }, mLabel !== lastMonth ? mLabel : ''));
+    lastMonth = mLabel;
     const col = el('div', { class: 'hm-col' });
     for (let d = 6; d >= 0; d--) {
       const key = new Date((todayUtc - (w * 7 + d)) * 86400000).toISOString().slice(0, 10);
@@ -271,14 +399,16 @@ function heatmap(days) {
     grid.append(col);
   }
   return el('div', { class: 'panel hm-panel' },
-    el('h2', {}, 'Daily P&L — last 12 weeks'),
-    grid);
+    el('h2', {}, title),
+    monthRow,
+    grid,
+    el('div', { class: 'dim-note' }, 'green = profitable day · red = losing day · intensity = size (UTC days)'));
 }
 
 // ---- learning log: the engine narrating what it changed and why ----
-function learningLog(items) {
+function learningLog(items, title = '🧠 Learning log') {
   return el('div', { class: 'panel' },
-    el('h2', {}, '🧠 Learning log'),
+    el('h2', {}, title),
     el('div', { class: 'scroll', style: 'max-height: 240px' },
       ...items.map((a) => el('div', { class: 'act act-evolve' },
         el('span', { class: 'act-time' }, new Date(a.ts).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })),
@@ -290,6 +420,9 @@ function learningLog(items) {
 function renderGrid(d) {
   const grid = document.getElementById('grid');
   grid.replaceChildren();
+  const overlay = compareOverlay(d.accounts, d.base);
+  if (overlay) grid.append(overlay);
+  grid.append(leaderboard(d.accounts, d.base, perfCache));
   if (dailyCache?.days?.length) grid.append(heatmap(dailyCache.days));
   for (const [family, title, sub] of FAMILIES) {
     const members = d.accounts.filter((a) => a.family === family);
@@ -306,11 +439,18 @@ function renderGrid(d) {
 let dataCache = null;
 let evoCache = null;
 let dailyCache = null;
+let perfCache = null;
+let benchCache = null;
 async function load() {
+  if (document.hidden) return; // no point polling a hidden tab
   try {
-    [dataCache, evoCache, dailyCache] = await Promise.all([
+    [dataCache, evoCache, dailyCache, perfCache] = await Promise.all([
       api('/api/strategy-accounts'), api('/api/evolution'), api('/api/daily-pnl'),
+      api('/api/performance').catch(() => null),
     ]);
+    if (!benchCache) {
+      api('/api/benchmark?days=180').then((b) => { benchCache = b.curve; }).catch(() => {});
+    }
     route();
     document.getElementById('status').textContent = `${dataCache.accounts.filter((a) => !a.watchOnly).length} live strategies`;
   } catch (err) {
@@ -320,13 +460,15 @@ async function load() {
 
 function route() {
   if (!dataCache) return;
-  const rule = decodeURIComponent(location.hash.slice(1));
+  let rule = '';
+  try { rule = decodeURIComponent(location.hash.slice(1)); } catch { rule = ''; } // a malformed hash must not blank the page
   const account = rule ? dataCache.accounts.find((a) => a.rule === rule) : null;
   if (account) renderDetail(account, dataCache.base);
   else renderGrid(dataCache);
 }
 
 window.addEventListener('hashchange', route);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) load(); });
 load();
 setInterval(load, 30 * 1000);
 

@@ -1,15 +1,35 @@
 import { el, api, timeAgo, fmtPnl, fmtPrice, safeUrl, renderTradeLogList, famDot } from '/shared.js';
 
-let currentSymbol = 'USO';
+let currentSymbol = localStorage.getItem('wt-chart-symbol') || 'USO';
 let signalsCache = [];
 let activeSignalId = null;
+
+// Panels pause their refresh while hovered — a poll must never reset the
+// scroll position mid-read or yank a button out from under the cursor.
+const hoverPause = new Set();
+const pendingRender = new Map();
+for (const id of ['blotter', 'tradelog', 'signals']) {
+  const n = document.getElementById(id);
+  n.addEventListener('mouseenter', () => hoverPause.add(id));
+  n.addEventListener('mouseleave', () => {
+    hoverPause.delete(id);
+    const fn = pendingRender.get(id);
+    if (fn) { pendingRender.delete(id); fn(); }
+  });
+}
+function renderUnlessHovered(id, fn) {
+  if (hoverPause.has(id)) pendingRender.set(id, fn);
+  else fn();
+}
 
 // ---- TradingView chart ----
 // The free embed widgets have no runtime setSymbol API; the officially
 // documented pattern is to recreate the container + config script per symbol.
 function loadChart(symbol) {
   currentSymbol = symbol.toUpperCase().trim();
+  localStorage.setItem('wt-chart-symbol', currentSymbol);
   document.getElementById('chart-symbol').textContent = currentSymbol;
+  updateChartPositions();
   const outer = document.getElementById('tv-chart');
   outer.replaceChildren();
 
@@ -41,16 +61,68 @@ function loadChart(symbol) {
   highlightWatchlist();
 }
 
-// ---- watchlist ----
-const WATCHLIST = ['SPY', 'QQQ', 'USO', 'XLE', 'GLD', 'UNG', 'VIXY', 'ITA', 'FRO', 'ZIM', 'EWT', 'BTCUSD'];
-{
-  const wl = document.getElementById('watchlist');
-  for (const sym of WATCHLIST) {
-    wl.append(el('button', { class: 'sym-btn', dataset: { sym }, onclick: () => loadChart(sym) }, sym));
-  }
+// ---- watchlist (editable, persisted) ----
+const DEFAULT_WATCHLIST = ['SPY', 'QQQ', 'USO', 'XLE', 'GLD', 'UNG', 'VIXY', 'ITA', 'FRO', 'ZIM', 'EWT', 'BTCUSD'];
+function getWatchlist() {
+  try {
+    const saved = JSON.parse(localStorage.getItem('wt-watchlist'));
+    if (Array.isArray(saved) && saved.length) return saved;
+  } catch { /* fall through */ }
+  return DEFAULT_WATCHLIST;
 }
+function renderWatchlist() {
+  const wl = document.getElementById('watchlist');
+  wl.replaceChildren();
+  for (const sym of getWatchlist()) {
+    wl.append(el('button', {
+      class: 'sym-btn', dataset: { sym },
+      title: `chart ${sym} · Alt-click to remove from watchlist`,
+      onclick: (e) => {
+        if (e.altKey) {
+          const next = getWatchlist().filter((s) => s !== sym);
+          localStorage.setItem('wt-watchlist', JSON.stringify(next));
+          renderWatchlist();
+        } else loadChart(sym);
+      },
+    }, sym));
+  }
+  wl.append(el('button', {
+    class: 'sym-btn wl-add', title: 'add the charted symbol to the watchlist',
+    onclick: () => {
+      const list = getWatchlist();
+      if (!list.includes(currentSymbol)) {
+        localStorage.setItem('wt-watchlist', JSON.stringify([...list, currentSymbol]));
+        renderWatchlist();
+      }
+    },
+  }, '+'));
+  highlightWatchlist();
+}
+renderWatchlist();
 function highlightWatchlist() {
   document.querySelectorAll('#watchlist .sym-btn').forEach((b) => b.classList.toggle('active', b.dataset.sym === currentSymbol));
+}
+
+// ---- open-position overlay for the charted symbol ----
+function updateChartPositions() {
+  let box = document.getElementById('chart-positions');
+  if (!box) {
+    box = el('div', { id: 'chart-positions', class: 'chart-positions' });
+    document.querySelector('#chart-panel .chart-head')?.after(box);
+  }
+  const open = (lastTradesData.trades || []).filter((t) => t.status === 'open'
+    && (t.symbol === currentSymbol || t.symbol.replace('-USD', 'USD') === currentSymbol));
+  box.replaceChildren();
+  if (!open.length) { box.hidden = true; return; }
+  box.hidden = false;
+  for (const t of open) {
+    box.append(el('span', { class: `pos-chip ${Number.isFinite(t.pnl) && t.pnl < 0 ? 'neg' : 'pos'}` },
+      famDot(t.strategy),
+      `${t.side} ${t.qty} @ ${fmtPrice(t.entry_price)}`,
+      t.stop_price ? ` · stop ${fmtPrice(t.stop_price)}` : '',
+      t.target_price ? ` · tgt ${fmtPrice(t.target_price)}` : '',
+      el('b', { class: Number.isFinite(t.pnl) ? (t.pnl >= 0 ? 'pnl-up' : 'pnl-down') : '' }, ` ${fmtPnl(t.pnl)}`)));
+  }
 }
 
 document.getElementById('load-symbol').addEventListener('click', () => {
@@ -61,9 +133,18 @@ document.getElementById('symbol-input').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') { const v = e.target.value.trim(); if (v) loadChart(v); }
 });
 
-function setStatus(msg) {
-  document.getElementById('status').textContent = msg;
+let statusTimer = null;
+function setStatus(msg, isErr = false) {
+  const s = document.getElementById('status');
+  s.textContent = msg;
+  s.classList.toggle('err', isErr);
+  clearTimeout(statusTimer);
+  // Status messages expire — a stale "Trade failed" must not sit in the
+  // header for hours looking current.
+  if (msg) statusTimer = setTimeout(() => { s.textContent = ''; s.classList.remove('err'); }, 10000);
 }
+document.getElementById('status').setAttribute('aria-live', 'polite');
+document.getElementById('toasts').setAttribute('aria-live', 'polite');
 
 // ---- toasts ----
 function toast(msg, kind = '') {
@@ -82,9 +163,14 @@ document.getElementById('open-settings').addEventListener('click', async () => {
     for (const [id, val] of [['set-ais', s.aisstream_key], ['set-wm', s.wm_api_key]]) {
       const input = document.getElementById(id);
       input.value = '';
-      input.placeholder = val || 'not set';
+      input.placeholder = val ? 'saved (' + val.slice(-4) + ')' : 'not set';
     }
     document.getElementById('set-scalper').checked = Boolean(s.scalper);
+    document.getElementById('set-webhook').value = s.webhook_url || '';
+    document.getElementById('set-risk').value = s.risk_per_trade ?? '';
+    document.getElementById('set-maxpos').value = s.max_positions ?? '';
+    document.getElementById('set-feebps').value = s.scalp_fee_bps ?? '';
+    document.getElementById('set-notional').value = s.scalp_notional ?? '';
   } catch { /* dialog still usable */ }
   settingsDlg.showModal();
 });
@@ -99,7 +185,13 @@ document.getElementById('save-settings').addEventListener('click', async () => {
   const wm = document.getElementById('set-wm').value.trim();
   if (ais) body.aisstream_key = ais;
   if (wm) body.wm_api_key = wm;
-  if (!Object.keys(body).length) { settingsDlg.close(); return; }
+  body.webhook_url = document.getElementById('set-webhook').value.trim();
+  const numVal = (id) => { const v = Number(document.getElementById(id).value); return Number.isFinite(v) && v > 0 ? v : undefined; };
+  if (numVal('set-risk') !== undefined) body.risk_per_trade = numVal('set-risk');
+  if (numVal('set-maxpos') !== undefined) body.max_positions = numVal('set-maxpos');
+  const fee = Number(document.getElementById('set-feebps').value);
+  if (Number.isFinite(fee) && fee >= 0 && document.getElementById('set-feebps').value !== '') body.scalp_fee_bps = fee;
+  if (numVal('set-notional') !== undefined) body.scalp_notional = numVal('set-notional');
   try {
     await api('/api/settings', { method: 'POST', body });
     toast(body.aisstream_key ? 'Saved — ships switching to global chokepoint coverage (check the Map)' : 'Settings saved');
@@ -107,6 +199,12 @@ document.getElementById('save-settings').addEventListener('click', async () => {
   } catch (err) {
     toast(`Save failed: ${err.message}`);
   }
+});
+document.getElementById('clear-webhook').addEventListener('click', async (e) => {
+  e.preventDefault();
+  document.getElementById('set-webhook').value = '';
+  await api('/api/settings', { method: 'POST', body: { webhook_url: '' } });
+  toast('Webhook cleared — notifications off');
 });
 document.getElementById('clear-ais').addEventListener('click', async (e) => {
   e.preventDefault();
@@ -140,11 +238,51 @@ function planRow(s) {
   );
 }
 
+let signalView = 'new';
+document.querySelectorAll('#signal-tabs button').forEach((b) => b.addEventListener('click', () => {
+  signalView = b.dataset.v;
+  document.querySelectorAll('#signal-tabs button').forEach((x) => x.classList.toggle('active', x === b));
+  renderSignals();
+}));
+
+// Signal history: what was taken, dismissed, expired — and for untaken
+// signals, what they WOULD have returned (scored by the counterfactual job).
+function renderSignalHistory(box) {
+  const past = signalsCache.filter((s) => s.status !== 'new').slice(0, 40);
+  if (!past.length) {
+    box.append(el('div', { class: 'empty' }, 'No signal history yet — taken, dismissed, and expired signals land here with their would-have-been outcomes.'));
+    return;
+  }
+  for (const s of past) {
+    box.append(el('div', { class: 'sig-hist-row' },
+      el('span', { class: `chip ${s.status}` }, s.status),
+      el('span', { class: 'sig-hist-main' },
+        el('button', { class: 'sym-btn', onclick: () => loadChart(s.tv_symbol) }, s.tv_symbol),
+        el('span', {}, ` ${s.headline.slice(0, 70)}`),
+        s.outcome_pnl != null
+          ? el('span', { class: `log-pnl ${s.outcome_pnl >= 0 ? 'pnl-up' : 'pnl-down'}`, title: s.outcome_note || '' }, ` ${fmtPnl(s.outcome_pnl)}` )
+          : null,
+        el('span', { class: 'log-meta' }, famDot(s.rule), `${s.rule} · ${timeAgo(s.created_at)}`)),
+      s.status === 'dismissed'
+        ? el('button', {
+            class: 'btn ghost small', onclick: async () => {
+              await api('/api/signals/dismiss', { method: 'POST', body: { id: s.id, undo: true } });
+              await loadSignals();
+            },
+          }, 'Undo')
+        : null));
+  }
+}
+
 function renderSignals() {
+  renderUnlessHovered('signals', () => renderSignalsNow());
+}
+function renderSignalsNow() {
   const box = document.getElementById('signals');
   box.replaceChildren();
   const fresh = signalsCache.filter((s) => s.status === 'new');
   document.getElementById('sig-count').textContent = fresh.length ? `(${fresh.length})` : '';
+  if (signalView === 'history') { renderSignalHistory(box); return; }
   if (!fresh.length) {
     box.append(el('div', { class: 'empty' }, 'Queue is clear — actionable signals are auto-traded within a minute and move to Positions. New signals appear as world events come in (checked every 5 min).'));
     return;
@@ -194,16 +332,42 @@ async function loadSignals() {
 }
 
 // ---- manual ticket ----
+// A prefilled signal id only stays attached while the symbol still matches —
+// typing a different symbol must not mis-attribute the trade to the signal.
+document.getElementById('symbol-input').addEventListener('input', () => {
+  const sig = signalsCache.find((s) => s.id === activeSignalId);
+  const typed = document.getElementById('symbol-input').value.trim().toUpperCase();
+  if (sig && typed && typed !== sig.tv_symbol) activeSignalId = null;
+});
+// Live notional preview so the cost of the ticket is visible before placing.
+function updateTicketPreview() {
+  let box = document.getElementById('ticket-preview');
+  if (!box) {
+    box = el('div', { id: 'ticket-preview', class: 'plan-meta' });
+    document.getElementById('place-trade')?.before(box);
+  }
+  const qty = Number(document.getElementById('ticket-qty').value);
+  const entry = Number(document.getElementById('ticket-entry').value);
+  if (!Number.isFinite(qty) || qty <= 0) { box.textContent = 'enter a positive quantity'; return; }
+  box.textContent = Number.isFinite(entry) && entry > 0
+    ? `notional ≈ $${(qty * entry).toFixed(0)}`
+    : 'market order — fills at the live quote (+ spread/slippage)';
+}
+for (const id of ['ticket-qty', 'ticket-entry']) document.getElementById(id).addEventListener('input', updateTicketPreview);
+updateTicketPreview();
+
 document.getElementById('place-trade').addEventListener('click', async () => {
   const btn = document.getElementById('place-trade');
   // The typed symbol wins over whatever the chart currently shows.
   const typed = document.getElementById('symbol-input').value.trim().toUpperCase();
   const symbol = typed || currentSymbol;
+  const qty = Number(document.getElementById('ticket-qty').value);
+  if (!Number.isFinite(qty) || qty <= 0) { setStatus('Quantity must be a positive number', true); return; }
   const num = (id) => { const v = Number(document.getElementById(id).value); return Number.isFinite(v) && v > 0 ? v : undefined; };
   const body = {
     symbol,
     side: document.getElementById('ticket-side').value,
-    qty: Number(document.getElementById('ticket-qty').value),
+    qty,
     entry_price: num('ticket-entry'),
     stop_price: num('ticket-stop'),
     target_price: num('ticket-target'),
@@ -214,13 +378,13 @@ document.getElementById('place-trade').addEventListener('click', async () => {
   btn.disabled = true; btn.textContent = 'Placing…';
   try {
     const r = await api('/api/trades', { method: 'POST', body });
-    setStatus(`Opened ${body.side} ${body.qty} ${symbol} @ ${r.entry_price.toFixed(2)} (paper)`);
+    toast(`Opened ${body.side} ${body.qty} ${symbol} @ ${r.entry_price.toFixed(2)} (paper)`, 'open');
     activeSignalId = null;
     for (const id of ['ticket-entry', 'ticket-stop', 'ticket-target']) document.getElementById(id).value = '';
     if (typed) loadChart(typed);
     await loadAll();
   } catch (err) {
-    setStatus(`Trade failed: ${err.message}`);
+    setStatus(`Trade failed: ${err.message}`, true);
   } finally {
     btn.disabled = false; btn.textContent = 'Place paper trade';
   }
@@ -306,20 +470,23 @@ let equityHistory = [];
 function renderTiles(summary) {
   const tiles = document.getElementById('tiles');
   const dayDelta = summary.equity - summary.startingEquity;
+  const todayPnl = (summary.todayRealized ?? 0);
   document.title = `World Trader · ${moneyFmt.format(summary.equity)}`;
   tiles.replaceChildren(
     tile('Account equity', moneyFmt.format(summary.equity), null, `${fmtPnl(dayDelta)} all-time`, sparkline(equityHistory)),
+    tile('Today', fmtPnl(todayPnl), todayPnl, `${summary.todayTrades ?? 0} closed today (ET) · gross exposure ${moneyFmt.format(summary.grossExposure ?? 0)}`),
     tile("Claude's P&L", fmtPnl(summary.claudePnl), summary.claudePnl, `${summary.claudeCount} autopilot trade${summary.claudeCount === 1 ? '' : 's'}`),
-    tile('Unrealized P&L', fmtPnl(summary.unrealized), summary.unrealized, `${summary.openCount} open position${summary.openCount === 1 ? '' : 's'}`),
-    tile('Realized P&L', fmtPnl(summary.realized), summary.realized, `${summary.closedCount} closed`),
+    tile('Unrealized P&L', fmtPnl(summary.unrealized), summary.unrealized, `${summary.openCount} open position${summary.openCount === 1 ? '' : 's'} · fees paid ${moneyFmt.format(summary.feesPaid ?? 0)}`),
     el('div', { class: 'tile tile-ring' },
       el('div', {},
         el('div', { class: 'label' }, 'Win rate'),
         el('div', { class: 'value' }, summary.winRate == null ? '—' : `${Math.round(summary.winRate * 100)}%`),
-        el('div', { class: 'sub' }, 'of closed trades'),
+        el('div', { class: 'sub' }, `n = ${summary.closedCount} closed`),
       ),
       winRing(summary.winRate)),
-    tile('Autopilot', summary.autopilot ? 'ON' : 'PAUSED', summary.autopilot ? 1 : -1, 'opens & exits trades',
+    tile('Autopilot', summary.killSwitch ? 'HALTED' : summary.autopilot ? 'ON' : 'PAUSED',
+      summary.killSwitch ? -1 : summary.autopilot ? 1 : -1,
+      summary.killSwitch ? 'daily-loss kill switch — entries resume tomorrow' : 'opens & exits trades',
       el('button', {
         class: 'btn', style: 'margin-top:6px',
         onclick: async () => {
@@ -333,9 +500,9 @@ function renderTiles(summary) {
   const vals = tiles.querySelectorAll('.tile .value');
   const targets = [
     ['equity', summary.equity, (v) => moneyFmt.format(v), vals[0]],
-    ['claude', summary.claudePnl, fmtPnl, vals[1]],
-    ['unreal', summary.unrealized, fmtPnl, vals[2]],
-    ['real', summary.realized, fmtPnl, vals[3]],
+    ['today', todayPnl, fmtPnl, vals[1]],
+    ['claude', summary.claudePnl, fmtPnl, vals[2]],
+    ['unreal', summary.unrealized, fmtPnl, vals[3]],
   ];
   for (const [key, to, fmt, node] of targets) {
     if (node) animateValue(node, prevTileVals[key], to, fmt);
@@ -357,10 +524,22 @@ document.querySelectorAll('#blotter-filters button').forEach((b) => b.addEventLi
   renderBlotter(lastTradesData);
 }));
 
+document.getElementById('blotter-sym').addEventListener('input', () => renderBlotter(lastTradesData));
+document.getElementById('blotter-sort').addEventListener('change', () => renderBlotter(lastTradesData));
+
 const BLOTTER_MAX_ROWS = 150;
 function renderBlotter(data) {
   lastTradesData = data;
-  const all = data.trades.filter((t) => blotterFilter === 'all' || t.status === blotterFilter);
+  updateChartPositions();
+  renderUnlessHovered('blotter', () => renderBlotterNow(data));
+}
+function renderBlotterNow(data) {
+  const symFilter = document.getElementById('blotter-sym').value.trim().toUpperCase();
+  const sortMode = document.getElementById('blotter-sort').value;
+  let all = data.trades.filter((t) => blotterFilter === 'all' || t.status === blotterFilter);
+  if (symFilter) all = all.filter((t) => t.symbol.includes(symFilter));
+  if (sortMode === 'pnl') all = [...all].sort((a, b) => (b.pnl ?? -Infinity) - (a.pnl ?? -Infinity));
+  else if (sortMode === 'pnl-asc') all = [...all].sort((a, b) => (a.pnl ?? Infinity) - (b.pnl ?? Infinity));
   const trades = all.slice(0, BLOTTER_MAX_ROWS);
   const truncated = all.length - trades.length;
   const box = document.getElementById('blotter');
@@ -390,7 +569,7 @@ function renderBlotter(data) {
       el('td', {}, fmtPrice(t.mark)),
       pnlCell(t.pnl),
       el('td', { class: Number.isFinite(pnlPct) ? (pnlPct >= 0 ? 'pnl-up' : 'pnl-down') : '' }, Number.isFinite(pnlPct) ? `${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}%` : '—'),
-      el('td', { class: 'dim' }, timeAgo(t.opened_at)),
+      el('td', { class: 'dim', title: new Date(t.opened_at).toLocaleString() }, timeAgo(t.opened_at)),
       el('td', { class: 'dim', style: 'text-align:left' }, t.status === 'closed' ? (t.exit_reason || 'closed') : (t.expires_at ? `by ${new Date(t.expires_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}` : 'open')),
       el('td', {}, t.status === 'open'
         ? el('button', {
@@ -518,7 +697,7 @@ function showBlotterTab(which) {
 
 // ---- trade log tape (broker-style: green buys, red sells, signed P&L) ----
 function renderTradeLog(trades) {
-  renderTradeLogList(document.getElementById('tradelog'), trades, 250);
+  renderUnlessHovered('tradelog', () => renderTradeLogList(document.getElementById('tradelog'), trades, 250));
 }
 
 // ---- activity feed ----
@@ -660,23 +839,37 @@ function connectStream() {
 }
 connectStream();
 
+// ---- keyboard shortcuts for the daily loop ----
+document.addEventListener('keydown', (e) => {
+  const inField = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName || '');
+  if (inField || e.ctrlKey || e.metaKey || e.altKey) return;
+  if (e.key === '/') { e.preventDefault(); document.getElementById('symbol-input').focus(); }
+  else if (e.key === 't') { const d = document.getElementById('manual-ticket'); d.open = !d.open; }
+  else if (e.key === '1') showBlotterTab('trades');
+  else if (e.key === '2') showBlotterTab('perf');
+  else if (e.key === '3') showBlotterTab('engine');
+});
+
 // ---- init ----
+// The chart never waits on the API, and one failed request must not blank the
+// whole page — each loader guards itself.
 const params = new URLSearchParams(location.search);
 const wantedSignal = params.get('signal');
+const wantedSymbol = params.get('symbol');
+if (wantedSymbol) currentSymbol = wantedSymbol.toUpperCase().trim();
 
+loadChart(currentSymbol);
 (async () => {
-  await loadSignals();
-  await loadAll();
+  try { await loadSignals(); } catch (err) { setStatus(`Signals unavailable: ${err.message}`, true); }
+  try { await loadAll(); } catch { /* loadAll sets its own status */ }
   if (wantedSignal) {
     const s = signalsCache.find((x) => x.id === wantedSignal);
     if (s) {
       loadChart(s.tv_symbol);
       document.getElementById(`sig-${s.id}`)?.scrollIntoView({ block: 'nearest' });
-      return;
     }
   }
-  loadChart(currentSymbol);
 })();
 
-setInterval(loadAll, 20 * 1000);
-setInterval(loadSignals, 60 * 1000);
+setInterval(() => loadAll().catch(() => {}), 20 * 1000);
+setInterval(() => loadSignals().catch(() => {}), 60 * 1000);

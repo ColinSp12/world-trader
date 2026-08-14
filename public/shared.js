@@ -80,7 +80,8 @@ export function famDot(strategy) {
 // Broker-style fill log: green buys, red sells, signed P&L on every exit.
 // Shared by the Trades page log and the per-strategy detail view.
 const lastNewestByBox = new WeakMap(); // per-container newest-fill marker for flash-on-arrival
-export function renderTradeLogList(box, trades, cap = 250) {
+const lastNewestByKey = new Map(); // string-keyed variant for containers recreated every render
+export function renderTradeLogList(box, trades, cap = 250, flashKey = null) {
   box.replaceChildren();
   const qtyFmt = (q) => (Number.isInteger(q) ? q : Number(q.toFixed(4)));
   const events = [];
@@ -109,8 +110,11 @@ export function renderTradeLogList(box, trades, cap = 250) {
     return;
   }
   events.sort((a, b) => b.ts - a.ts);
-  const prevNewest = lastNewestByBox.get(box) ?? Infinity; // first render: nothing flashes
-  lastNewestByBox.set(box, events[0].ts);
+  // flashKey survives container recreation (detail views rebuild their DOM);
+  // the WeakMap covers long-lived containers like the Trades page tape.
+  const prevNewest = (flashKey ? lastNewestByKey.get(flashKey) : lastNewestByBox.get(box)) ?? Infinity;
+  if (flashKey) lastNewestByKey.set(flashKey, events[0].ts);
+  else lastNewestByBox.set(box, events[0].ts);
   for (const ev of events.slice(0, cap)) {
     box.append(el('div', { class: `log-row ${ev.buy ? 'buy' : 'sell'}${ev.ts > prevNewest ? ' fresh' : ''}` },
       el('span', { class: 'log-arrow' }, ev.buy ? '▲' : '▼'),
@@ -120,7 +124,7 @@ export function renderTradeLogList(box, trades, cap = 250) {
           ? el('span', { class: `log-pnl ${ev.pnl >= 0 ? 'pnl-up' : 'pnl-down'}` },
               `${fmtPnl(ev.pnl)}${Number.isFinite(ev.pct) ? ` (${ev.pct >= 0 ? '+' : ''}${ev.pct.toFixed(2)}%)` : ''}`)
           : null,
-        el('span', { class: 'log-meta' }, famDot(ev.strategy), `${ev.tag} · ${timeAgo(ev.ts)}`),
+        el('span', { class: 'log-meta', title: new Date(ev.ts).toLocaleString() }, famDot(ev.strategy), `${ev.tag} · ${timeAgo(ev.ts)}`),
       ),
     ));
   }

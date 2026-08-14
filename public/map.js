@@ -9,8 +9,15 @@ L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
   subdomains: 'abcd', maxZoom: 12,
 }).addTo(map);
 
-let flightsOn = true;
-let shipsOn = true;
+// Layer preferences persist — declutter choices should survive a reload.
+const pref = (k, dflt = true) => localStorage.getItem(k) === null ? dflt : localStorage.getItem(k) === '1';
+const setPref = (k, v) => localStorage.setItem(k, v ? '1' : '0');
+let flightsOn = pref('wt-map-flights');
+let shipsOn = pref('wt-map-ships');
+let chokesOn = pref('wt-map-chokes');
+let nightOn = pref('wt-map-night');
+let fxOn = pref('wt-map-fx');
+
 const legend = L.control({ position: 'bottomleft' });
 legend.onAdd = () => {
   const div = document.createElement('div');
@@ -23,6 +30,7 @@ legend.onAdd = () => {
     title: 'military worldwide · all air traffic when zoomed in',
     onclick: () => {
       flightsOn = !flightsOn;
+      setPref('wt-map-flights', flightsOn);
       if (!flightsOn) flightLayer.clearLayers();
       else refreshFlights();
       updateFlightsToggle(null);
@@ -32,11 +40,33 @@ legend.onAdd = () => {
     class: 'legend-toggle ships', id: 'ships-toggle',
     onclick: () => {
       shipsOn = !shipsOn;
+      setPref('wt-map-ships', shipsOn);
       if (!shipsOn) shipLayer.clearLayers();
       else refreshShips();
       updateShipsToggle(null);
     },
   }, '⚓ ships'));
+  const simpleToggle = (id, label, get, flip) => el('button', {
+    class: `legend-toggle${get() ? '' : ' off'}`, id,
+    onclick: (e) => { flip(); e.target.classList.toggle('off', !get()); },
+  }, label);
+  div.append(simpleToggle('chokes-toggle', '◆ chokepoints', () => chokesOn, () => {
+    chokesOn = !chokesOn;
+    setPref('wt-map-chokes', chokesOn);
+    for (const { marker } of chokeMarkers.values()) chokesOn ? marker.addTo(map) : map.removeLayer(marker);
+    for (const m of extraChokeMarkers) chokesOn ? m.addTo(map) : map.removeLayer(m);
+  }));
+  div.append(simpleToggle('night-toggle', '☾ night shade', () => nightOn, () => {
+    nightOn = !nightOn;
+    setPref('wt-map-night', nightOn);
+    nightOn ? nightLayer.addTo(map) : map.removeLayer(nightLayer);
+  }));
+  div.append(simpleToggle('fx-toggle', '✨ signal glow', () => fxOn, () => {
+    fxOn = !fxOn;
+    setPref('wt-map-fx', fxOn);
+    if (!fxOn) fxLayer.clearLayers();
+    else renderAmbience(signalsCache);
+  }));
   div.append(el('div', { style: 'color: var(--muted)' }, 'marker size = severity'));
   L.DomEvent.disableClickPropagation(div);
   return div;
@@ -64,7 +94,8 @@ function updateShipsToggle(count, source) {
 }
 
 // ---- day/night terminator (approximate solar position; visual only) ----
-const nightLayer = L.polygon([], { stroke: false, fillColor: '#000', fillOpacity: 0.24, interactive: false }).addTo(map);
+const nightLayer = L.polygon([], { stroke: false, fillColor: '#000', fillOpacity: 0.24, interactive: false });
+if (nightOn) nightLayer.addTo(map);
 function updateTerminator() {
   const now = new Date();
   const dayOfYear = (Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()) - Date.UTC(now.getUTCFullYear(), 0, 0)) / 86400000;
@@ -115,17 +146,28 @@ function chokePopup(c, stats) {
       style: stats.ratio < 0.7 ? 'color: var(--down); font-weight: 600' : '',
     }, `${stats.transits} transits ${new Date(stats.date).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })} · ${pct >= 0 ? '+' : ''}${pct}% vs 28-day avg`));
   }
-  if (c.syms) wrap.append(el('div', { class: 'm' }, `watch on disruption: ${c.syms}`));
+  if (c.syms) {
+    // Symbols deep-link to the Trades chart — chokepoint stress → chart in one click.
+    const symRow = el('div', { class: 'm' }, 'watch on disruption: ');
+    c.syms.split('·').map((s) => s.trim()).forEach((sym, i) => {
+      if (i) symRow.append(' · ');
+      symRow.append(el('a', { href: `/trades?symbol=${encodeURIComponent(sym)}` }, sym));
+    });
+    wrap.append(symRow);
+  }
   if (stats) wrap.append(el('div', { class: 'm' }, 'transit data: IMF PortWatch'));
   return wrap;
 }
 
+const extraChokeMarkers = [];
 for (const c of CHOKEPOINTS) {
   const marker = L.marker([c.lat, c.lon], {
     icon: L.divIcon({ className: 'choke-icon', html: '◆', iconSize: [14, 14], iconAnchor: [7, 7] }),
     keyboard: false,
-  }).bindPopup(chokePopup(c, null)).addTo(map);
+  }).bindPopup(chokePopup(c, null));
+  if (chokesOn) marker.addTo(map);
   if (PW_IDS[c.name]) chokeMarkers.set(PW_IDS[c.name], { marker, info: c });
+  else extraChokeMarkers.push(marker);
 }
 
 async function refreshChokepoints() {
@@ -176,8 +218,21 @@ function arcLine(from, to) {
   });
 }
 
+// Glow popup: the most eye-catching layer must not be a dead end — a click
+// reveals which signal lit it up and links to the trade side.
+function glowPopup(s) {
+  return el('div', {},
+    el('div', { style: 'font-weight:600' }, s.headline),
+    el('div', { class: 'm' }, `${s.rule} · ${s.direction} · ${s.status}`),
+    Number.isFinite(s.plan_entry)
+      ? el('div', { class: 'm' }, `${s.tv_symbol}: entry ${fmtPrice(s.plan_entry)} · stop ${fmtPrice(s.plan_stop)} · target ${fmtPrice(s.plan_target)}`)
+      : null,
+    el('div', { class: 'm' }, el('a', { href: `/trades?signal=${encodeURIComponent(s.id)}` }, 'Open in Trades →')));
+}
+
 function renderAmbience(signals) {
   fxLayer.clearLayers();
+  if (!fxOn) return;
   const active = signals.filter((s) => s.status === 'new' || s.status === 'taken');
   for (const s of active.slice(0, 20)) {
     const ev = s.event;
@@ -187,16 +242,16 @@ function renderAmbience(signals) {
       if (cp) {
         L.marker([cp.lat, cp.lon], {
           icon: L.divIcon({ className: 'glow-icon', html: '<span class="glow choke"></span>', iconSize: [70, 70], iconAnchor: [35, 35] }),
-          interactive: false, keyboard: false,
-        }).addTo(fxLayer);
+          keyboard: false,
+        }).bindPopup(glowPopup(s)).addTo(fxLayer);
       }
       continue;
     }
     if (!ev || !Number.isFinite(ev.lat) || !Number.isFinite(ev.lon)) continue;
     L.marker([ev.lat, ev.lon], {
       icon: L.divIcon({ className: 'glow-icon', html: '<span class="glow"></span>', iconSize: [90, 90], iconAnchor: [45, 45] }),
-      interactive: false, keyboard: false,
-    }).addTo(fxLayer);
+      keyboard: false,
+    }).bindPopup(glowPopup(s)).addTo(fxLayer);
     // arc to the nearest chokepoint for shipping/oil-flavored signals
     if (s.rule === 'chokepoint-disruption' || s.rule === 'oil-producer-unrest') {
       const cp = nearestChokepoint(ev.lat, ev.lon);
@@ -281,38 +336,74 @@ map.on('moveend zoomend', () => {
   viewportTimer = setTimeout(refreshFlights, 600);
 });
 
+// Event → signal → trade joins, resolved at popup-open time so the popup
+// always answers "what did the engine do about this event?"
+let signalsCache = [];
+let tradesBySignal = new Map();
+function signalForEvent(e) {
+  return signalsCache.find((s) => s.event && s.event.id === e.id);
+}
+
 function popupContent(e) {
   const wrap = el('div', {},
     el('div', { style: 'font-weight:600' }, e.title),
     el('div', { class: 'm' }, [KIND_LABEL[e.kind] || e.kind, SEV_LABEL[e.severity], e.country, timeAgo(e.ts)].filter(Boolean).join(' · ')),
   );
   if (e.detail) wrap.append(el('div', { class: 'm' }, e.detail.slice(0, 220)));
+  const s = signalForEvent(e);
+  if (s) {
+    wrap.append(el('div', { class: 'm', style: 'border-top: 1px solid var(--grid); margin-top: 4px; padding-top: 4px' },
+      `⚡ signal: ${s.rule} · ${s.direction} ${s.tv_symbol} · ${s.status}`));
+    for (const t of tradesBySignal.get(s.id) || []) {
+      wrap.append(el('div', { class: 'm', style: t.pnl >= 0 ? 'color: var(--up)' : 'color: var(--down)' },
+        `↳ trade: ${t.side} ${t.qty} ${t.symbol} @ ${fmtPrice(t.entry_price)} · ${t.status}${Number.isFinite(t.pnl) ? ` · ${t.pnl >= 0 ? '+' : ''}$${t.pnl.toFixed(2)}` : ''}`));
+    }
+    wrap.append(el('div', { class: 'm' }, el('a', { href: `/trades?signal=${encodeURIComponent(s.id)}` }, 'Open in Trades →')));
+  }
   const su = safeUrl(e.url);
   if (su) wrap.append(el('div', { class: 'm' }, el('a', { href: su, target: '_blank', rel: 'noopener' }, 'source ↗')));
   return wrap;
 }
 
+// Diff-keyed marker updates: existing markers stay put (open popups survive
+// the 60s refresh), vanished events are removed, new ones added.
+const ringById = new Map();
 function renderMarkers(events) {
-  markerLayer.clearLayers();
-  markerById.clear();
+  const seen = new Set();
+  let rings = ringById.size;
   for (const e of events) {
-    const marker = L.circleMarker([e.lat, e.lon], {
-      radius: 3 + e.severity * 2.5,
-      color: KIND_COLOR[e.kind] || '#898781',
-      weight: 1.5,
-      fillColor: KIND_COLOR[e.kind] || '#898781',
-      fillOpacity: 0.55,
-    });
-    marker.bindPopup(popupContent(e));
-    marker.addTo(markerLayer);
-    markerById.set(e.id, marker);
-    // severe events get an animated pulse ring
-    if (e.severity >= 3) {
-      L.marker([e.lat, e.lon], {
-        icon: L.divIcon({ className: 'pulse-icon', html: `<span class="pulse-ring ${e.kind}"></span>`, iconSize: [36, 36], iconAnchor: [18, 18] }),
-        interactive: false, keyboard: false,
-      }).addTo(markerLayer);
+    seen.add(e.id);
+    let marker = markerById.get(e.id);
+    if (!marker) {
+      marker = L.circleMarker([e.lat, e.lon], {
+        radius: 3 + e.severity * 2.5,
+        color: KIND_COLOR[e.kind] || '#898781',
+        weight: 1.5,
+        fillColor: KIND_COLOR[e.kind] || '#898781',
+        fillOpacity: 0.55,
+      });
+      marker.bindPopup(() => popupContent(marker.__event)); // resolved at open time
+      marker.addTo(markerLayer);
+      markerById.set(e.id, marker);
+      // severe events get an animated pulse ring (capped — each one is a
+      // perpetually-animating DOM node)
+      if (e.severity >= 3 && rings < 15) {
+        const ring = L.marker([e.lat, e.lon], {
+          icon: L.divIcon({ className: 'pulse-icon', html: `<span class="pulse-ring ${e.kind}"></span>`, iconSize: [36, 36], iconAnchor: [18, 18] }),
+          interactive: false, keyboard: false,
+        }).addTo(markerLayer);
+        ringById.set(e.id, ring);
+        rings++;
+      }
     }
+    marker.__event = e;
+  }
+  for (const [id, m] of markerById) {
+    if (seen.has(id)) continue;
+    markerLayer.removeLayer(m);
+    markerById.delete(id);
+    const r = ringById.get(id);
+    if (r) { markerLayer.removeLayer(r); ringById.delete(id); }
   }
 }
 
@@ -337,14 +428,20 @@ function renderEventList(events) {
 function renderSignals(signals) {
   const box = document.getElementById('signals');
   box.replaceChildren();
-  const fresh = signals.filter((s) => s.status === 'new').slice(0, 12);
-  if (!fresh.length) { box.append(el('div', { class: 'empty' }, 'No new signals. The engine scans events every 5 minutes.')); return; }
+  // Taken signals stay visible — the autopilot executes within a minute, and
+  // the map panel going blank right when something happened was the old bug.
+  const fresh = signals
+    .filter((s) => (s.status === 'new' || s.status === 'taken') && Date.now() - s.created_at < 48 * 3600e3)
+    .slice(0, 12);
+  if (!fresh.length) { box.append(el('div', { class: 'empty' }, 'No live signals. The engine scans events every 5 minutes.')); return; }
   for (const s of fresh) {
+    const canFly = s.event && Number.isFinite(s.event.lat) && Number.isFinite(s.event.lon);
     box.append(el('div', { class: 'sig-card' },
       el('div', { class: 'head' },
         el('h3', {}, s.headline),
         el('span', { class: `chip ${s.direction}` }, s.direction),
         el('span', { class: `chip ${s.confidence}` }, s.confidence),
+        s.status === 'taken' ? el('span', { class: 'chip auto' }, '✓ traded') : null,
       ),
       Number.isFinite(s.plan_entry)
         ? el('div', { class: 'plan-meta' }, `${s.tv_symbol}: entry ${fmtPrice(s.plan_entry)} · stop ${fmtPrice(s.plan_stop)} · target ${fmtPrice(s.plan_target)} · size ${s.plan_qty}`)
@@ -352,6 +449,14 @@ function renderSignals(signals) {
       el('div', { class: 'thesis' }, s.thesis.length > 200 ? s.thesis.slice(0, 200) + '…' : s.thesis),
       el('div', { class: 'actions' },
         el('a', { class: 'btn primary', href: `/trades?signal=${encodeURIComponent(s.id)}` }, 'Open in Trades →'),
+        canFly ? el('button', {
+          class: 'btn',
+          onclick: () => {
+            map.flyTo([s.event.lat, s.event.lon], Math.max(map.getZoom(), 5));
+            const m = markerById.get(s.event.id);
+            if (m) m.openPopup();
+          },
+        }, 'Fly to event') : null,
       ),
     ));
   }
@@ -384,9 +489,39 @@ function showTab(which) {
 tabEvents.addEventListener('click', () => showTab('events'));
 tabNews.addEventListener('click', () => showTab('news'));
 
+// Time-window selector for the events layer (persists).
+let eventHours = Number(localStorage.getItem('wt-map-hours')) || 48;
+{
+  const HOURS = [6, 24, 48, 168];
+  const row = el('div', { class: 'tabbtns', id: 'hours-row', style: 'padding: 4px 8px' },
+    ...HOURS.map((h) => el('button', {
+      class: h === eventHours ? 'active' : '',
+      onclick: () => {
+        eventHours = h;
+        localStorage.setItem('wt-map-hours', String(h));
+        document.querySelectorAll('#hours-row button').forEach((b, i) => b.classList.toggle('active', HOURS[i] === h));
+        refresh();
+      },
+    }, h === 168 ? '7d' : `${h}h`)));
+  document.getElementById('events')?.before(row);
+}
+
 async function refresh() {
   try {
-    const [ev, sig, news] = await Promise.all([api('/api/events?hours=48'), api('/api/signals'), api('/api/news')]);
+    const [ev, sig, news, tr] = await Promise.all([
+      api(`/api/events?hours=${eventHours}`), api('/api/signals'), api('/api/news'),
+      api('/api/trades?limit=150').catch(() => null),
+    ]);
+    signalsCache = sig.signals;
+    tradesBySignal = new Map();
+    if (tr) {
+      for (const t of tr.trades) {
+        if (!t.signal_id) continue;
+        const arr = tradesBySignal.get(t.signal_id) || [];
+        arr.push(t);
+        tradesBySignal.set(t.signal_id, arr);
+      }
+    }
     renderMarkers(ev.events);
     renderEventList(ev.events);
     renderSignals(sig.signals);

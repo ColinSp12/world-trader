@@ -8,6 +8,31 @@ import { DatabaseSync } from 'node:sqlite';
 const ROOT = import.meta.dirname;
 const PUBLIC_DIR = path.join(ROOT, 'public');
 const PORT = Number(process.env.PORT || 3555);
+// Bound to loopback by default: the API is unauthenticated, so LAN exposure
+// would let any device on the network trade or overwrite API keys.
+// Set HOST=0.0.0.0 explicitly to accept LAN connections.
+const HOST = process.env.HOST || '127.0.0.1';
+
+// ---- persistent log file (console is invisible under the minimized autostart) ----
+const LOG_DIR = path.join(ROOT, 'logs');
+try { fs.mkdirSync(LOG_DIR, { recursive: true }); } catch { /* exists */ }
+const LOG_FILE = path.join(LOG_DIR, 'server.log');
+function logToFile(line) {
+  try {
+    try { if (fs.statSync(LOG_FILE).size > 5e6) fs.renameSync(LOG_FILE, LOG_FILE + '.1'); } catch { /* no file yet */ }
+    fs.appendFileSync(LOG_FILE, line + '\n');
+  } catch { /* logging must never crash the engine */ }
+}
+const _clog = console.log.bind(console);
+const _cerr = console.error.bind(console);
+console.log = (...a) => { _clog(...a); logToFile(`${new Date().toISOString()} ${a.join(' ')}`); };
+console.error = (...a) => { _cerr(...a); logToFile(`${new Date().toISOString()} ERROR ${a.join(' ')}`); };
+
+// One unguarded throw must not silently kill the trading engine; log and keep
+// running (start.cmd adds a watchdog restart for genuinely fatal states).
+const bootTs = Date.now();
+process.on('uncaughtException', (e) => console.error('[fatal] uncaughtException:', e?.stack || e));
+process.on('unhandledRejection', (e) => console.error('[fatal] unhandledRejection:', e?.stack || e));
 const WM_BASE = 'https://api.worldmonitor.app';
 let wmKey = process.env.WM_API_KEY || ''; // may be overridden from the settings table after db init
 const UA = 'world-trader/0.1 (local paper-trading experiment)';
@@ -86,14 +111,46 @@ db.exec(`
     updated_at INTEGER,
     note TEXT
   );
+  CREATE TABLE IF NOT EXISTS rule_tuning_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule TEXT NOT NULL,
+    ts INTEGER NOT NULL,
+    stop_mult REAL NOT NULL,
+    target_mult REAL NOT NULL,
+    horizon_mult REAL NOT NULL,
+    note TEXT
+  );
+  CREATE TABLE IF NOT EXISTS bars (
+    symbol TEXT NOT NULL,
+    ts INTEGER NOT NULL,
+    o REAL NOT NULL, h REAL NOT NULL, l REAL NOT NULL, c REAL NOT NULL,
+    PRIMARY KEY (symbol, ts)
+  );
+  CREATE TABLE IF NOT EXISTS candles (
+    symbol TEXT NOT NULL,
+    ts INTEGER NOT NULL,
+    o REAL NOT NULL, h REAL NOT NULL, l REAL NOT NULL, c REAL NOT NULL,
+    PRIMARY KEY (symbol, ts)
+  );
+  CREATE TABLE IF NOT EXISTS backtests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at INTEGER NOT NULL,
+    label TEXT,
+    params TEXT NOT NULL,
+    results TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_trades_status ON trades (status, strategy);
+  CREATE INDEX IF NOT EXISTS idx_trades_closed ON trades (status, closed_at);
 `);
 
 const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
 
-// Migrate databases created before the strategy columns existed.
-for (const col of ['strategy TEXT', 'variant TEXT']) {
+// Migrate databases created before newer columns existed.
+for (const col of ['strategy TEXT', 'variant TEXT', 'fees REAL DEFAULT 0', 'mae REAL', 'mfe REAL']) {
   try { db.exec(`ALTER TABLE trades ADD COLUMN ${col}`); } catch { /* column already exists */ }
 }
+try { db.exec('ALTER TABLE signals ADD COLUMN outcome_pnl REAL'); } catch { /* exists */ }
+try { db.exec('ALTER TABLE signals ADD COLUMN outcome_note TEXT'); } catch { /* exists */ }
 db.prepare(`UPDATE trades SET
   strategy = COALESCE(strategy, (SELECT rule FROM signals WHERE signals.id = trades.signal_id), 'manual'),
   variant = COALESCE(variant, 'base')`).run();
@@ -111,8 +168,75 @@ wmKey = getSetting('wm_api_key', wmKey);
 
 function logActivity(kind, message) {
   db.prepare('INSERT INTO activity (ts, kind, message) VALUES (?, ?, ?)').run(Date.now(), kind, message);
-  db.prepare('DELETE FROM activity WHERE id NOT IN (SELECT id FROM activity ORDER BY id DESC LIMIT 500)').run();
+  db.prepare('DELETE FROM activity WHERE id NOT IN (SELECT id FROM activity ORDER BY id DESC LIMIT 2000)').run();
   console.log(`[${kind}] ${message}`);
+}
+
+// ---- optional push notifications (ntfy.sh topic URL or any webhook that accepts a text POST) ----
+let webhookUrl = '';
+function notify(title, text) {
+  if (!webhookUrl) return;
+  fetch(webhookUrl, {
+    method: 'POST',
+    headers: { Title: title.replace(/[^\x20-\x7e]/g, ''), 'User-Agent': UA },
+    body: text,
+    signal: AbortSignal.timeout(10000),
+  }).catch((e) => console.error('[notify] failed:', e.message));
+}
+
+// ---------------------------------------------------------------- market hours
+// US equity session awareness — without it, ETF fills execute 24/7 against
+// frozen out-of-hours quotes and event strategies book untradeable gaps.
+const US_HOLIDAYS = new Set([
+  '2026-01-01', '2026-01-19', '2026-02-16', '2026-04-03', '2026-05-25', '2026-06-19',
+  '2026-07-03', '2026-09-07', '2026-11-26', '2026-12-25',
+  '2027-01-01', '2027-01-18', '2027-02-15', '2027-03-26', '2027-05-31', '2027-06-18',
+  '2027-07-05', '2027-09-06', '2027-11-25', '2027-12-24',
+]);
+const ET_FMT = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'America/New_York', hour12: false,
+  weekday: 'short', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
+});
+const etMemo = { min: 0, val: null };
+function etNow(ts = Date.now()) {
+  const minKey = Math.floor(ts / 60000);
+  if (etMemo.min === minKey && etMemo.val) return etMemo.val;
+  const parts = Object.fromEntries(ET_FMT.formatToParts(new Date(ts)).map((p) => [p.type, p.value]));
+  const val = {
+    day: `${parts.year}-${parts.month}-${parts.day}`,
+    weekend: parts.weekday === 'Sat' || parts.weekday === 'Sun',
+    minutes: Number(parts.hour) % 24 * 60 + Number(parts.minute),
+  };
+  etMemo.min = minKey; etMemo.val = val;
+  return val;
+}
+function usMarketOpen(ts = Date.now()) {
+  const p = etNow(ts);
+  if (p.weekend || US_HOLIDAYS.has(p.day)) return false;
+  return p.minutes >= 9 * 60 + 30 && p.minutes < 16 * 60;
+}
+const isCrypto = (sym) => sym.endsWith('-USD');
+// Crypto trades around the clock; everything else only during the US session.
+const marketOpenFor = (sym, ts) => isCrypto(sym) || usMarketOpen(ts);
+
+// ---------------------------------------------------------------- friction
+// Honest fills for the ETF book: half the typical bid/ask spread plus a
+// slippage allowance, applied adversely on entry AND exit. Thin single-country
+// funds pay much more than SPY — that difference is real and matters.
+const SPREAD_BPS = {
+  SPY: 1, QQQ: 1, IWM: 2, GLD: 1, SLV: 2, TLT: 1, USO: 3, XLE: 2, UNG: 6,
+  FXI: 3, EWT: 4, ITA: 3, FRO: 10, ZIM: 12, WEAT: 10, VIXY: 5, TRV: 3,
+  EWS: 5, INDA: 3, EWJ: 2, EWY: 3, EWZ: 3, EWW: 4, EWG: 3, EWU: 3, EWQ: 4,
+  EWI: 5, EWP: 5, TUR: 8, EIS: 6, KSA: 6, EZA: 5, ECH: 6, EIDO: 6, EPHE: 8,
+  VNM: 6, EPOL: 6, NGE: 15, ARGT: 5, EWA: 3, EWC: 3, GREK: 8, EGPT: 15,
+  PAK: 15, THD: 6, EWM: 6, EPU: 10, GXG: 12, URA: 4, LMT: 2, PANW: 2, BUG: 6, SMH: 2,
+};
+const SLIPPAGE_BPS = 2;
+const frictionBps = (sym) => (SPREAD_BPS[sym] ?? 12) / 2 + SLIPPAGE_BPS;
+// Buying (long entry / short exit) pays up; selling receives less.
+function applyFriction(sym, side, price, isEntry) {
+  const buying = (side === 'long') === isEntry;
+  return price * (1 + (buying ? 1 : -1) * frictionBps(sym) / 10000);
 }
 
 // ---------------------------------------------------------------- helpers
@@ -462,7 +586,14 @@ async function yahooQuote(symbol, host = 'query1') {
     }
     if (ranges.length) adrPct = ranges.reduce((a, b) => a + b, 0) / ranges.length;
   }
-  return { price: meta.regularMarketPrice, prevClose: meta.chartPreviousClose ?? meta.previousClose ?? null, adrPct, source: `yahoo:${host}` };
+  // Prior-session close = second-to-last daily close in the 5d window.
+  // (meta.chartPreviousClose is the close before the WHOLE window — wrong day.)
+  let prevClose = null;
+  if (q0?.close) {
+    const closes = q0.close.filter(Number.isFinite);
+    if (closes.length >= 2) prevClose = closes[closes.length - 2];
+  }
+  return { price: meta.regularMarketPrice, prevClose: prevClose ?? meta.previousClose ?? null, adrPct, source: `yahoo:${host}` };
 }
 
 async function binanceQuote(symbol) {
@@ -507,15 +638,27 @@ function tradePnl(t, price) {
 }
 
 function realizedTotal() {
-  const closed = db.prepare("SELECT * FROM trades WHERE status = 'closed'").all();
-  return closed.reduce((s, t) => s + (tradePnl(t) ?? 0), 0);
+  return db.prepare(`SELECT COALESCE(SUM((exit_price - entry_price) * (CASE side WHEN 'long' THEN 1 ELSE -1 END) * qty), 0) AS s
+    FROM trades WHERE status = 'closed'`).get().s;
 }
 
-function closeTrade(t, exitPrice, reason) {
+// Marked equity for sizing: prefer the latest mark-to-market snapshot (so a
+// book deep in unrealized drawdown sizes smaller), fall back to realized-only.
+let lastMarkedEquity = { ts: 0, equity: null };
+function sizingEquity() {
+  const realizedEq = STARTING_EQUITY + realizedTotal();
+  if (lastMarkedEquity.equity != null && Date.now() - lastMarkedEquity.ts < 30 * 60 * 1000) {
+    return Math.min(realizedEq, lastMarkedEquity.equity);
+  }
+  return realizedEq;
+}
+
+function closeTrade(t, exitPrice, reason, frictionDollars = 0) {
   // Guarded + idempotent: concurrent closers (manual close vs the 500ms
   // scalper tick vs the manage loop) race across awaits — only one wins.
-  const info = db.prepare("UPDATE trades SET status = 'closed', closed_at = ?, exit_price = ?, exit_reason = ? WHERE id = ? AND status = 'open'")
-    .run(Date.now(), exitPrice, reason, t.id);
+  const info = db.prepare(`UPDATE trades SET status = 'closed', closed_at = ?, exit_price = ?, exit_reason = ?,
+      fees = COALESCE(fees, 0) + ? WHERE id = ? AND status = 'open'`)
+    .run(Date.now(), exitPrice, reason, frictionDollars, t.id);
   if (Number(info.changes) === 0) return null; // already closed elsewhere
   const pnl = tradePnl({ ...t, status: 'closed', exit_price: exitPrice });
   // Scalper fills log as 'scalp' so the toast layer (open/close only) stays quiet.
@@ -538,7 +681,7 @@ const STRATEGY_META = {
   'ma-cross': { family: 'tech', title: 'EMA 5/20 Momentum', desc: 'The 5-day EMA crossing the 20-day EMA on a liquid ETF → trade in the direction of the cross. Classic short-term trend following: ride fresh momentum shifts for a day or two.' },
   'rsi-reversal': { family: 'tech', title: 'RSI(2) Mean Reversion', desc: '2-period RSI under 10 → long the snap-back; over 90 → short. Connors-style: extreme short-term readings on index/sector ETFs tend to revert within 1–2 sessions.' },
   'breakout-20': { family: 'tech', title: '20-Day Breakout', desc: 'Close beyond the prior 20-day high or low (Donchian channel) → trade the direction of the break. Range expansion tends to carry short-term follow-through.' },
-  'momo-scalper': { family: 'hyper', title: '1-Minute Momentum Scalper', desc: '24/7 crypto scalper on real-time Binance prices (BTC, ETH, SOL, XRP, DOGE, LTC): enters when 1-minute momentum exceeds ~6 bps, exits at +12 bps target / −9 bps stop / 5-minute time-out, $5k notional per position. A 2 bps per-side fee is baked into every fill — the honest scalping question is whether the edge beats costs. Executes dozens to hundreds of round trips a day.' },
+  'momo-scalper': { family: 'hyper', title: 'Momentum Scalper', desc: '24/7 crypto scalper on real-time Binance prices (BTC, ETH, SOL, XRP, DOGE, LTC): enters on short-burst momentum, exits at bps-scale targets/stops or a minutes-scale time-out, $5k notional per position. Costs are modeled honestly — ~10 bps per-side taker fee and spread-crossing fills baked into every trade — and the parameters evolve in generations, so the open question the account answers is whether any momentum edge survives real costs.' },
 };
 
 // ---------------------------------------------------------------- autopilot
@@ -546,10 +689,12 @@ const STRATEGY_META = {
 // (entry, volatility-scaled stop, 2R target, risk-based size, time exit), then
 // opens and manages the paper positions itself. PAPER MONEY ONLY.
 let autopilotOn = getSetting('autopilot', '1') === '1';
-const MAX_OPEN_POSITIONS = 10; // event+tech book (scalper positions tracked separately)
 const SCALP_RULE = 'momo-scalper';
-const RISK_PER_TRADE = 0.01;         // 1% of equity at the stop
+// Risk knobs are user-tunable from Settings (persisted; sane clamps applied).
+let MAX_OPEN_POSITIONS = clamp(Number(getSetting('max_positions', '10')) || 10, 1, 30); // event+tech book
+let RISK_PER_TRADE = clamp(Number(getSetting('risk_per_trade', '1')) / 100 || 0.01, 0.001, 0.05); // % of equity at the stop
 const MAX_POSITION_FRACTION = 0.15;  // notional cap per position
+webhookUrl = getSetting('webhook_url', '');
 // Short-term regime: horizons of hours to 2 days, targets sized to be
 // reachable within that window (≤ ~3× a day's range).
 const RULE_HORIZON_DAYS = {
@@ -573,8 +718,26 @@ const STRATEGY_VARIANTS = {
 const ruleTuning = new Map();
 for (const r of db.prepare('SELECT * FROM rule_tuning').all()) ruleTuning.set(r.rule, r);
 
+// VIX regime cached for 5 min — buildPlan used to fetch ^VIX on every call.
+const vixRegime = { ts: 0, halved: false };
+async function vixHalvesRisk() {
+  if (Date.now() - vixRegime.ts < 5 * 60 * 1000) return vixRegime.halved;
+  try {
+    const vix = await getQuote('^VIX');
+    vixRegime.halved = vix.price >= 30;
+  } catch { /* VIX unavailable — keep last known regime */ }
+  vixRegime.ts = Date.now();
+  return vixRegime.halved;
+}
+
+// Signal confidence scales size — computed by every rule, it should matter.
+const CONFIDENCE_SIZE = { high: 1.25, medium: 1, low: 0.6 };
+
 async function buildPlan(direction, rule, symbol, v = STRATEGY_VARIANTS.base, sizeFactor = 1) {
   const q = await getQuote(symbol);
+  // Never plan or fill on a stale last-known-good quote — after an outage that
+  // would price trades at hours-old marks.
+  if (q.stale) throw new Error(`quote for ${symbol} is stale — not trading on it`);
   const adr = Math.min(Math.max(q.adrPct ?? 0.02, 0.008), 0.06);
   const entry = q.price;
   const tune = ruleTuning.get(rule);
@@ -587,15 +750,17 @@ async function buildPlan(direction, rule, symbol, v = STRATEGY_VARIANTS.base, si
   const target = entry + dir * v.targetR * stopDist * (tune?.target_mult ?? 1);
   const horizon = (RULE_HORIZON_DAYS[rule] ?? 4) * v.horizonMult * (tune?.horizon_mult ?? 1);
 
-  const equity = STARTING_EQUITY + realizedTotal();
+  const equity = sizingEquity();
   let riskFrac = RISK_PER_TRADE;
-  try {
-    const vix = await getQuote('^VIX');
-    if (vix.price >= 30) riskFrac = RISK_PER_TRADE / 2; // defensive sizing in panicky tape
-  } catch { /* VIX unavailable — keep normal sizing */ }
+  if (await vixHalvesRisk()) riskFrac = RISK_PER_TRADE / 2; // defensive sizing in panicky tape
   let qty = Math.floor((equity * riskFrac * sizeFactor) / stopDist);
   if (qty * entry > equity * MAX_POSITION_FRACTION) qty = Math.floor((equity * MAX_POSITION_FRACTION) / entry);
-  qty = Math.max(qty, 1);
+  if (qty < 1) {
+    // A single share is allowed only when its stop-risk stays inside ~2× the
+    // budget; the old unconditional 1-share floor forced trades the risk math rejected.
+    if (stopDist <= equity * riskFrac * Math.max(sizeFactor, 0.1) * 2) qty = 1;
+    else throw new Error(`sizing: one share of ${symbol} exceeds the risk budget`);
+  }
   return { entry, stop, target, qty, horizon };
 }
 
@@ -640,6 +805,48 @@ function sizeAdjustment(rule, variant) {
   return { factor: 1, why: null };
 }
 
+// ---- portfolio-level risk controls ----
+const GROSS_EXPOSURE_CAP = 1.0; // event/tech open notional ≤ 1× equity
+const KILL_DAILY_LOSS_FRAC = 0.02; // realized daily loss that halts new entries
+const CLUSTER_LIMITS = [
+  { name: 'energy/shipping', symbols: new Set(['USO', 'XLE', 'UNG', 'FRO', 'ZIM', 'WEAT']), maxOpen: 4 },
+];
+let killSwitchLoggedDay = '';
+function etDayStart(now) {
+  const p = etNow(now);
+  return now - p.minutes * 60000 - (now % 60000);
+}
+// Daily-loss kill switch: a bad enough realized day stops ALL new entries
+// (event, tech, and scalper) until the next ET trading day.
+function killSwitchActive(now = Date.now()) {
+  const dayPnl = db.prepare(`SELECT COALESCE(SUM(${AUTO_PNL_SQL}), 0) AS s FROM trades WHERE status = 'closed' AND closed_at >= ?`)
+    .get(etDayStart(now)).s;
+  const limit = (lastMarkedEquity.equity ?? STARTING_EQUITY) * KILL_DAILY_LOSS_FRAC;
+  const active = dayPnl <= -limit;
+  const day = etNow(now).day;
+  if (active && killSwitchLoggedDay !== day) {
+    killSwitchLoggedDay = day;
+    logActivity('risk', `KILL SWITCH: today's realized P&L ${dayPnl.toFixed(2)} breaches the ${(KILL_DAILY_LOSS_FRAC * 100).toFixed(0)}% daily-loss limit — no new entries until the next ET day`);
+    notify('world-trader: kill switch', `Daily loss limit hit (${dayPnl.toFixed(2)}). New entries paused until tomorrow.`);
+  }
+  return active;
+}
+
+// Sleep/downtime detection: setInterval timers freeze while the laptop sleeps;
+// on wake we defer time exits briefly so they fill on fresh quotes, not the
+// pre-sleep stale marks, and we record that the book went unmanaged.
+let lastHeartbeat = Date.now();
+let wakeGraceUntil = 0;
+function heartbeat() {
+  const now = Date.now();
+  if (now - lastHeartbeat > 2 * 60 * 1000) {
+    const mins = Math.round((now - lastHeartbeat) / 60000);
+    wakeGraceUntil = now + 5 * 60 * 1000;
+    logActivity('info', `Downtime detected (~${mins} min — sleep or outage). Positions were unmanaged; time exits deferred 5 min while quotes refresh.`);
+  }
+  lastHeartbeat = now;
+}
+
 let autopilotRunning = false;
 async function autopilotTick() {
   if (autopilotRunning) return; // quote fetches can outlast the interval
@@ -659,11 +866,18 @@ async function autopilotTick() {
       }
     }
 
-    if (autopilotOn) {
+    if (autopilotOn && !killSwitchActive(now)) {
       // 2. Enter: take planned long/short signals (watch = info only).
+      // High-confidence signals go first when slots are scarce.
+      const CONF_ORDER = { high: 0, medium: 1, low: 2 };
       const actionable = db.prepare(`SELECT * FROM signals WHERE status = 'new' AND plan_entry IS NOT NULL
-        AND direction IN ('long','short') AND created_at > ? ORDER BY created_at DESC`).all(now - 24 * 3600 * 1000);
+        AND direction IN ('long','short') AND created_at > ? ORDER BY created_at DESC`).all(now - 24 * 3600 * 1000)
+        .sort((a, b) => (CONF_ORDER[a.confidence] ?? 1) - (CONF_ORDER[b.confidence] ?? 1) || b.created_at - a.created_at);
       for (const s of actionable) {
+        // Stocks/ETFs only fill during the US session — an event signal firing
+        // Saturday would otherwise book an untradeable weekend gap. The signal
+        // stays queued and executes at the next open if still fresh.
+        if (!marketOpenFor(s.tv_symbol, now)) continue;
         const openCount = db.prepare("SELECT COUNT(*) AS c FROM trades WHERE status = 'open' AND COALESCE(strategy, '') != ?").get(SCALP_RULE).c;
         if (openCount >= MAX_OPEN_POSITIONS) { logActivity('skip', `Max ${MAX_OPEN_POSITIONS} open positions — ${s.tv_symbol} stays queued`); break; }
         // One position per symbol PER STRATEGY: each strategy runs its own
@@ -675,6 +889,17 @@ async function autopilotTick() {
           logActivity('skip', `${s.rule} already holds ${s.tv_symbol} — skipped duplicate signal`);
           continue;
         }
+        // Correlated-cluster cap: four rules all reach for the energy/shipping
+        // complex — without this the whole book can become one long-oil bet.
+        const cluster = CLUSTER_LIMITS.find((c) => c.symbols.has(s.tv_symbol));
+        if (cluster) {
+          const inCluster = db.prepare(`SELECT COUNT(*) AS c FROM trades WHERE status = 'open' AND symbol IN (${[...cluster.symbols].map(() => '?').join(',')}) AND COALESCE(strategy,'') != ?`)
+            .get(...cluster.symbols, SCALP_RULE).c;
+          if (inCluster >= cluster.maxOpen) {
+            logActivity('skip', `${cluster.name} cluster already has ${inCluster} open positions — ${s.tv_symbol} stays queued`);
+            continue;
+          }
+        }
         try {
           const pick = pickVariant(s.rule);
           if (!pick) { // defensive — base always has factor > 0
@@ -684,38 +909,62 @@ async function autopilotTick() {
           }
           const { name: variant, adj } = pick;
           if (adj.why) logActivity('info', adj.why);
-          const plan = await buildPlan(s.direction, s.rule, s.tv_symbol, STRATEGY_VARIANTS[variant], adj.factor);
+          const confFactor = CONFIDENCE_SIZE[s.confidence] ?? 1;
+          const plan = await buildPlan(s.direction, s.rule, s.tv_symbol, STRATEGY_VARIANTS[variant], adj.factor * confFactor);
+          // Gross-exposure cap: total deployed notional stays within 1× equity.
+          const grossOpen = db.prepare("SELECT COALESCE(SUM(entry_price * qty), 0) AS n FROM trades WHERE status = 'open' AND COALESCE(strategy,'') != ?").get(SCALP_RULE).n;
+          if (grossOpen + plan.entry * plan.qty > sizingEquity() * GROSS_EXPOSURE_CAP) {
+            logActivity('skip', `Gross exposure cap — ${s.tv_symbol} (${(plan.entry * plan.qty).toFixed(0)}) stays queued until notional frees up`);
+            continue;
+          }
           // Write the executed plan back so the signal card and history show
           // the trade the autopilot actually took, not the baseline sketch.
           db.prepare('UPDATE signals SET plan_entry = ?, plan_stop = ?, plan_target = ?, plan_qty = ?, horizon_days = ? WHERE id = ?')
             .run(plan.entry, plan.stop, plan.target, plan.qty, plan.horizon, s.id);
-          db.prepare(`INSERT INTO trades (opened_at, symbol, side, qty, entry_price, stop_price, target_price, expires_at, auto, signal_id, thesis, strategy, variant)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)`)
-            .run(now, s.tv_symbol, s.direction, plan.qty, plan.entry, plan.stop, plan.target,
-              now + plan.horizon * 24 * 3600 * 1000, s.id, s.headline, s.rule, variant);
+          // Honest fill: pay half-spread + slippage on the way in.
+          const fill = applyFriction(s.tv_symbol, s.direction, plan.entry, true);
+          const entryFriction = Math.abs(fill - plan.entry) * plan.qty;
+          db.prepare(`INSERT INTO trades (opened_at, symbol, side, qty, entry_price, stop_price, target_price, expires_at, auto, signal_id, thesis, strategy, variant, fees)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)`)
+            .run(now, s.tv_symbol, s.direction, plan.qty, fill, plan.stop, plan.target,
+              now + plan.horizon * 24 * 3600 * 1000, s.id, s.headline, s.rule, variant, entryFriction);
           db.prepare("UPDATE signals SET status = 'taken' WHERE id = ?").run(s.id);
-          logActivity('open', `AUTO opened ${s.direction} ${plan.qty} ${s.tv_symbol} @ ${plan.entry.toFixed(2)} · stop ${plan.stop.toFixed(2)} · target ${plan.target.toFixed(2)} · ${s.rule}/${variant} · exit by ${new Date(now + plan.horizon * 86400000).toISOString().slice(0, 10)} — ${s.headline}`);
+          logActivity('open', `AUTO opened ${s.direction} ${plan.qty} ${s.tv_symbol} @ ${fill.toFixed(2)} · stop ${plan.stop.toFixed(2)} · target ${plan.target.toFixed(2)} · ${s.rule}/${variant} · exit by ${new Date(now + plan.horizon * 86400000).toISOString().slice(0, 10)} — ${s.headline}`);
           broadcast('fill', { action: 'open', symbol: s.tv_symbol });
         } catch (err) {
           logActivity('info', `Entry failed for ${s.tv_symbol}: ${err.message}`);
         }
       }
+    }
 
-      // 3. Manage: stop / target / time exits on open positions.
-      // The scalper manages its own book on real-time prices — excluded here.
-      // COALESCE: NULL-strategy rows must NOT be excluded (SQLite 3VL trap).
-      const open = db.prepare("SELECT * FROM trades WHERE status = 'open' AND COALESCE(strategy, '') != ?").all(SCALP_RULE);
-      if (open.length) {
-        const quotes = await getQuotes([...new Set(open.map((t) => t.symbol))]);
-        for (const t of open) {
-          const q = quotes[t.symbol];
-          if (!Number.isFinite(q?.price)) continue;
-          const dir = t.side === 'long' ? 1 : -1;
-          let reason = null;
-          if (Number.isFinite(t.stop_price) && (q.price - t.stop_price) * dir <= 0) reason = 'stop hit';
-          else if (Number.isFinite(t.target_price) && (q.price - t.target_price) * dir >= 0) reason = 'target hit';
-          else if (t.expires_at && now >= t.expires_at) reason = 'time exit';
-          if (reason) closeTrade(t, q.price, reason);
+    // 3. Manage: stop / target / time exits on open positions — ALWAYS, even
+    // with autopilot paused. Pause means "no new entries", never "abandon the
+    // stops on live positions" (the scalper has worked this way all along).
+    // The scalper manages its own book on real-time prices — excluded here.
+    // COALESCE: NULL-strategy rows must NOT be excluded (SQLite 3VL trap).
+    const open = db.prepare("SELECT * FROM trades WHERE status = 'open' AND COALESCE(strategy, '') != ?").all(SCALP_RULE);
+    if (open.length) {
+      const quotes = await getQuotes([...new Set(open.map((t) => t.symbol))]);
+      for (const t of open) {
+        // ETFs only exit during the session: out-of-hours the quote is a
+        // frozen close no broker would fill at.
+        if (!marketOpenFor(t.symbol, now)) continue;
+        const q = quotes[t.symbol];
+        // Never fill exits on stale or failed quotes — wait for a fresh mark.
+        if (!Number.isFinite(q?.price) || q.stale) continue;
+        const dir = t.side === 'long' ? 1 : -1;
+        // Track excursion extremes: how far each trade ran for/against us.
+        // This is the data the stop-tuning evolution actually needs.
+        const exc = (q.price - t.entry_price) * dir * t.qty;
+        db.prepare("UPDATE trades SET mfe = MAX(COALESCE(mfe, 0), ?), mae = MIN(COALESCE(mae, 0), ?) WHERE id = ? AND status = 'open'")
+          .run(exc, exc, t.id);
+        let reason = null, raw = q.price;
+        if (Number.isFinite(t.stop_price) && (q.price - t.stop_price) * dir <= 0) reason = 'stop hit'; // stop-market: gap-through fills at market
+        else if (Number.isFinite(t.target_price) && (q.price - t.target_price) * dir >= 0) { reason = 'target hit'; raw = t.target_price; } // limit fills AT the target
+        else if (t.expires_at && now >= t.expires_at && now >= wakeGraceUntil) reason = 'time exit';
+        if (reason) {
+          const fill = applyFriction(t.symbol, t.side, raw, false);
+          closeTrade(t, fill, reason, Math.abs(fill - raw) * t.qty);
         }
       }
     }
@@ -844,17 +1093,25 @@ const SCALP_PAIRS = {
   'XRP-USD': 'XRPUSDT', 'DOGE-USD': 'DOGEUSDT', 'LTC-USD': 'LTCUSDT',
 };
 const SCALP_TEST = process.env.SCALP_TEST === '1';
+// Costs are modeled honestly: Binance spot taker is ~10 bps per side, and
+// fills cross the spread (long entries lift the ask, exits hit the bid).
+// scalp_fee_bps in settings overrides for lower fee tiers.
 const SCALP = {
   tickMs: 500,                            // decision cadence
-  lookbackMs: 60 * 1000,                  // momentum window
-  histLen: 160,                           // ~80s of 500ms snapshots
-  enterBps: 6,
-  targetBps: 12,
-  stopBps: 9,
-  maxHoldMs: 5 * 60 * 1000,
-  feeBps: 2,                              // per side, baked into fill prices
+  lookbackMs: 90 * 1000,                  // momentum window
+  histLen: 360,                           // derived — always covers 2× lookback
+  enterBps: 20,
+  targetBps: 35,
+  stopBps: 22,
+  maxHoldMs: 10 * 60 * 1000,
+  feeBps: clamp(Number(getSetting('scalp_fee_bps', '10')) || 10, 0, 50), // per side
   notional: 5000,                         // per position, virtual dollars
 };
+// The history buffer must always cover the momentum lookback — an evolved
+// lookback beyond the buffer would otherwise silently disable every entry.
+function syncScalpDerived() {
+  SCALP.histLen = Math.ceil((SCALP.lookbackMs * 2) / SCALP.tickMs);
+}
 const PAIR_TO_SYM = new Map(Object.entries(SCALP_PAIRS).map(([s, p]) => [p, s]));
 const scalpHist = new Map(); // symbol -> [{ts, price}]
 
@@ -884,10 +1141,26 @@ function loadScalpGen() {
   }
   scalpBase = { ...SCALP_DEFAULTS, ...JSON.parse(row.params) };
   Object.assign(SCALP, scalpBase);
+  syncScalpDerived();
   applyTestOverrides();
   scalpGen = row.gen;
 }
 db.prepare("UPDATE trades SET variant = 'g1' WHERE strategy = ? AND variant = 'scalp'").run(SCALP_RULE);
+// One-time migration to the honest fee model: parameters learned against the
+// old 2 bps fee answer the wrong cost question — retire that lineage and
+// restart at cost-aware defaults so every future lesson is real.
+if (getSetting('fee_model', '1') !== '2') {
+  const active = db.prepare("SELECT * FROM strategy_params WHERE rule = ? AND status = 'active' ORDER BY gen DESC LIMIT 1").get(SCALP_RULE);
+  if (active) {
+    db.prepare("UPDATE strategy_params SET status = 'retired', retired_at = ?, note = COALESCE(note, '') || ' — retired: fee model upgraded to realistic taker costs' WHERE id = ?")
+      .run(Date.now(), active.id);
+    db.prepare("INSERT INTO strategy_params (rule, gen, params, created_at, activated_at, status, note) VALUES (?, ?, ?, ?, ?, 'active', ?)")
+      .run(SCALP_RULE, active.gen + 1, JSON.stringify(SCALP_DEFAULTS), Date.now(), Date.now(),
+        'fresh start under the honest cost model: ~10 bps/side taker fee plus spread-crossing fills');
+    logActivity('evolve', `Fee model upgraded to realistic Binance taker costs — momo-scalper restarted at gen ${active.gen + 1} (enter ${SCALP_DEFAULTS.enterBps}bps · target ${SCALP_DEFAULTS.targetBps}bps · stop ${SCALP_DEFAULTS.stopBps}bps · hold ${SCALP_DEFAULTS.maxHoldMs / 60000}min). Old-fee generations are marked retired.`);
+  }
+  setSetting('fee_model', '2');
+}
 loadScalpGen();
 
 function evolveScalper() {
@@ -932,10 +1205,10 @@ function evolveScalper() {
     for (const k of ['enterBps', 'targetBps', 'stopBps']) p[k] = jitter(p[k], 0.12);
     reasons.push('profitable — exploring nearby parameters to keep improving');
   }
-  p.enterBps = clamp(p.enterBps, 2, 40);
-  p.targetBps = clamp(p.targetBps, Math.max(6, SCALP.feeBps * 4), 80);
-  p.stopBps = clamp(p.stopBps, 4, 60);
-  p.maxHoldMs = clamp(p.maxHoldMs, 60 * 1000, 30 * 60 * 1000);
+  p.enterBps = clamp(p.enterBps, 5, 80);
+  p.targetBps = clamp(p.targetBps, Math.max(15, SCALP.feeBps * 1.5), 150);
+  p.stopBps = clamp(p.stopBps, 8, 100);
+  p.maxHoldMs = clamp(p.maxHoldMs, 60 * 1000, 45 * 60 * 1000);
   p.lookbackMs = clamp(p.lookbackMs, 20 * 1000, 5 * 60 * 1000);
 
   const newGen = scalpGen + 1;
@@ -943,9 +1216,11 @@ function evolveScalper() {
     .run(SCALP_RULE, newGen, JSON.stringify(p), Date.now(), Date.now(), reasons.join('; '));
   scalpBase = p;
   Object.assign(SCALP, p);
+  syncScalpDerived();
   applyTestOverrides();
   scalpGen = newGen;
   logActivity('evolve', `EVOLVED momo-scalper gen ${newGen - 1} → gen ${newGen} after ${s.closed} trades (P&L ${s.pnl >= 0 ? '+' : ''}${s.pnl.toFixed(2)}, ${Math.round(winRate * 100)}% wins, ${s.targets} targets/${s.stops} stops/${s.timeouts} time-outs). Lesson: ${reasons.join('; ')}. New params: enter ${p.enterBps.toFixed(1)}bps · target ${p.targetBps.toFixed(1)}bps · stop ${p.stopBps.toFixed(1)}bps · hold ${(p.maxHoldMs / 60000).toFixed(1)}min`);
+  notify('world-trader: scalper evolved', `Gen ${newGen - 1} retired at ${s.pnl >= 0 ? '+' : ''}$${s.pnl.toFixed(2)} over ${s.closed} trades. ${reasons.join('; ')}`);
   broadcast('fill', { action: 'evolve', symbol: SCALP_RULE });
 }
 
@@ -989,6 +1264,10 @@ function evolveSlowRules() {
       ON CONFLICT(rule) DO UPDATE SET stop_mult = excluded.stop_mult, target_mult = excluded.target_mult,
         horizon_mult = excluded.horizon_mult, updated_at = excluded.updated_at, note = excluded.note`)
       .run(rule, t.stop_mult, t.target_mult, t.horizon_mult, Date.now(), reasons.join('; '));
+    // Append-only history so the learning trail is auditable — the upsert
+    // above keeps only the latest state.
+    db.prepare('INSERT INTO rule_tuning_history (rule, ts, stop_mult, target_mult, horizon_mult, note) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(rule, Date.now(), t.stop_mult, t.target_mult, t.horizon_mult, reasons.join('; '));
     t.updated_at = Date.now();
     ruleTuning.set(rule, t);
     logActivity('evolve', `TUNED ${rule} after ${s.closed} closed trades (window P&L ${s.pnl >= 0 ? '+' : ''}${s.pnl.toFixed(2)}). Lesson: ${reasons.join('; ')} → stop×${t.stop_mult.toFixed(2)} · target×${t.target_mult.toFixed(2)}`);
@@ -1030,7 +1309,7 @@ function startBinanceStream() {
         const bid = parseFloat(d.b), ask = parseFloat(d.a);
         if (!Number.isFinite(bid) || !Number.isFinite(ask)) return;
         const sym = PAIR_TO_SYM.get(d.s);
-        if (sym) livePrices.set(sym, { price: (bid + ask) / 2, ts: Date.now() });
+        if (sym) livePrices.set(sym, { price: (bid + ask) / 2, bid, ask, ts: Date.now() });
       } catch { /* malformed frame */ }
     };
     ws.onclose = retry;
@@ -1039,14 +1318,39 @@ function startBinanceStream() {
   connect();
 }
 
+// Minute candles per scalp pair, persisted for backtesting/replay. The
+// in-progress minute lives in memory; completed minutes flush to SQLite.
+const liveCandles = new Map(); // symbol -> { ts, o, h, l, c }
+function updateCandle(sym, px, now) {
+  const minute = Math.floor(now / 60000) * 60000;
+  const cur = liveCandles.get(sym);
+  if (!cur || cur.ts !== minute) {
+    if (cur) {
+      db.prepare('INSERT OR REPLACE INTO candles (symbol, ts, o, h, l, c) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(sym, cur.ts, cur.o, cur.h, cur.l, cur.c);
+    }
+    liveCandles.set(sym, { ts: minute, o: px, h: px, l: px, c: px });
+  } else {
+    if (px > cur.h) cur.h = px;
+    if (px < cur.l) cur.l = px;
+    cur.c = px;
+  }
+}
+
 async function scalperTick() {
   if (scalperRunning) return;
   scalperRunning = true;
   try {
     const now = Date.now();
-    // REST fallback if the websocket goes quiet (e.g. geo-blocked or dropped).
-    const allStale = livePrices.size === 0 || [...livePrices.values()].every((p) => now - p.ts > 10000);
-    if (allStale && now - lastRestFallback > 15000) {
+    const openScalps = db.prepare("SELECT * FROM trades WHERE status = 'open' AND strategy = ?").all(SCALP_RULE);
+    // REST fallback when the websocket goes quiet — and ALWAYS when a symbol
+    // we hold a position in has gone stale, so open scalps are never abandoned
+    // to a dead feed.
+    const staleSym = (s) => { const l = livePrices.get(s); return !l || now - l.ts > 10000; };
+    const needRest = livePrices.size === 0
+      || [...livePrices.values()].every((p) => now - p.ts > 10000)
+      || openScalps.some((t) => staleSym(t.symbol));
+    if (needRest && now - lastRestFallback > 15000) {
       lastRestFallback = now;
       try {
         const symsParam = encodeURIComponent(JSON.stringify(Object.values(SCALP_PAIRS)));
@@ -1054,7 +1358,7 @@ async function scalperTick() {
         for (const d of data) {
           const sym = PAIR_TO_SYM.get(d.symbol);
           const px = parseFloat(d.price);
-          if (sym && Number.isFinite(px)) livePrices.set(sym, { price: px, ts: now });
+          if (sym && Number.isFinite(px)) livePrices.set(sym, { price: px, bid: px, ask: px, ts: now });
         }
       } catch { /* next fallback window retries */ }
     }
@@ -1065,35 +1369,49 @@ async function scalperTick() {
       // complete record instead of freezing stats mid-flight.
       const genFull = db.prepare("SELECT COUNT(*) AS n FROM trades WHERE status = 'closed' AND strategy = ? AND variant = ?")
         .get(SCALP_RULE, `g${scalpGen}`).n >= EVOLVE_MIN_CLOSED;
+      const killed = killSwitchActive(now);
       for (const sym of Object.keys(SCALP_PAIRS)) {
         const live = livePrices.get(sym);
-        if (!live || now - live.ts > 10000) continue;
+        if (!live) continue;
+        const tickAge = now - live.ts;
         const px = live.price;
-        const hist = scalpHist.get(sym) || [];
-        hist.push({ ts: now, price: px });
-        while (hist.length > SCALP.histLen) hist.shift();
-        while (hist.length && now - hist[0].ts > SCALP.lookbackMs * 2) hist.shift(); // drop pre-gap snapshots
-        scalpHist.set(sym, hist);
+        if (tickAge <= 10000) {
+          const hist = scalpHist.get(sym) || [];
+          hist.push({ ts: now, price: px });
+          while (hist.length > SCALP.histLen) hist.shift();
+          while (hist.length && now - hist[0].ts > SCALP.lookbackMs * 2) hist.shift(); // drop pre-gap snapshots
+          scalpHist.set(sym, hist);
+          updateCandle(sym, px, now);
+        }
 
         // Manage open positions on EVERY tick — a paused scalper must still
-        // honor its stops/targets/time-outs, never abandon a live position.
-        const open = db.prepare("SELECT * FROM trades WHERE status = 'open' AND symbol = ? AND strategy = ?").get(sym, SCALP_RULE);
+        // honor its stops/targets/time-outs. A somewhat-stale mark (≤60s,
+        // e.g. REST fallback cadence) still beats abandoning the position.
+        const open = openScalps.find((t) => t.symbol === sym);
         if (open) {
+          if (tickAge > 60000) continue; // minutes-old marks are not fills
           const dir = open.side === 'long' ? 1 : -1;
-          const exitFill = px * (1 - dir * SCALP.feeBps / 10000);
+          // Exits cross the spread: longs sell the bid, shorts cover at the ask.
+          const rawExit = dir === 1 ? (live.bid ?? px) : (live.ask ?? px);
+          const exitFill = rawExit * (1 - dir * SCALP.feeBps / 10000);
           const movedBps = ((exitFill - open.entry_price) / open.entry_price) * 10000 * dir;
+          const exc = (px - open.entry_price) * dir * open.qty;
+          db.prepare("UPDATE trades SET mfe = MAX(COALESCE(mfe, 0), ?), mae = MIN(COALESCE(mae, 0), ?) WHERE id = ? AND status = 'open'")
+            .run(exc, exc, open.id);
           let reason = null;
           if (movedBps >= SCALP.targetBps) reason = 'scalp target';
           else if (movedBps <= -SCALP.stopBps) reason = 'scalp stop';
           else if (now - open.opened_at >= SCALP.maxHoldMs) reason = 'scalp time';
-          if (reason) closeTrade(open, exitFill, reason); // closeTrade broadcasts the fill
+          if (reason) closeTrade(open, exitFill, reason, Math.abs(exitFill - px) * open.qty); // closeTrade broadcasts the fill
           continue;
         }
 
-        if (!autopilotOn || !scalperOn || genFull) continue; // entries only while enabled
+        // Entries need everything: enabled, sample open, no kill switch, fresh tick.
+        if (!autopilotOn || !scalperOn || genFull || killed || tickAge > 10000) continue;
 
         // momentum vs the snapshot ~lookbackMs ago; the baseline must itself
         // be fresh — after a sleep/outage gap, price drift would fake momentum.
+        const hist = scalpHist.get(sym) || [];
         const cutoff = now - SCALP.lookbackMs;
         let back = null;
         for (const h of hist) { if (h.ts <= cutoff) back = h; else break; }
@@ -1102,15 +1420,18 @@ async function scalperTick() {
         if (Math.abs(momBps) < SCALP.enterBps) continue;
         const side = momBps > 0 ? 'long' : 'short';
         const dir = side === 'long' ? 1 : -1;
-        const fill = px * (1 + dir * SCALP.feeBps / 10000); // adverse fee on entry
+        // Entries cross the spread too: longs lift the ask, shorts hit the bid.
+        const rawEntry = dir === 1 ? (live.ask ?? px) : (live.bid ?? px);
+        const fill = rawEntry * (1 + dir * SCALP.feeBps / 10000);
         const qty = +(SCALP.notional / fill).toFixed(6);
-        db.prepare(`INSERT INTO trades (opened_at, symbol, side, qty, entry_price, stop_price, target_price, expires_at, auto, signal_id, thesis, strategy, variant)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?, ?)`)
+        db.prepare(`INSERT INTO trades (opened_at, symbol, side, qty, entry_price, stop_price, target_price, expires_at, auto, signal_id, thesis, strategy, variant, fees)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?, ?, ?)`)
           .run(now, sym, side, qty, fill,
             fill * (1 - dir * SCALP.stopBps / 10000),
             fill * (1 + dir * SCALP.targetBps / 10000),
             now + SCALP.maxHoldMs,
-            `1-min momentum ${momBps.toFixed(1)} bps`, SCALP_RULE, `g${scalpGen}`);
+            `momentum ${momBps.toFixed(1)} bps over ${(SCALP.lookbackMs / 1000).toFixed(0)}s`, SCALP_RULE, `g${scalpGen}`,
+            Math.abs(fill - px) * qty);
         logActivity('scalp', `SCALP ${side} ${qty} ${sym} @ ${fill.toFixed(2)} (momentum ${momBps > 0 ? '+' : ''}${momBps.toFixed(1)} bps)`);
         broadcast('fill', { action: 'open', symbol: sym });
       }
@@ -1355,13 +1676,230 @@ async function snapshotEquity() {
   if (open.length) {
     const quotes = await getQuotes([...new Set(open.map((t) => t.symbol))]);
     for (const t of open) {
-      const pnl = tradePnl(t, quotes[t.symbol]?.price);
+      // A failed quote must not silently drop this position's P&L (fake equity
+      // dips) — fall back to the last cached mark, then the entry price.
+      const mark = Number.isFinite(quotes[t.symbol]?.price) ? quotes[t.symbol].price
+        : (quoteCache.get(t.symbol)?.price ?? t.entry_price);
+      const pnl = tradePnl(t, mark);
       if (pnl != null) unrealized += pnl;
     }
   }
-  db.prepare('INSERT OR REPLACE INTO equity_snapshots (ts, equity) VALUES (?, ?)')
-    .run(now, STARTING_EQUITY + realizedTotal() + unrealized);
-  db.prepare('DELETE FROM equity_snapshots WHERE ts < ?').run(now - 90 * 24 * 3600 * 1000);
+  const equity = STARTING_EQUITY + realizedTotal() + unrealized;
+  lastMarkedEquity = { ts: now, equity };
+  db.prepare('INSERT OR REPLACE INTO equity_snapshots (ts, equity) VALUES (?, ?)').run(now, equity);
+  // Snapshots are kept forever — they ARE the long-run performance record.
+}
+
+// ---------------------------------------------------------------- backtesting
+// Daily-bar backtests for the technical family (fully reproducible from
+// history), plus replay of RECORDED live signals for the event family (that
+// dataset grows every day the server runs). Same variants, same friction
+// model, entry on the NEXT bar's open — no look-ahead.
+const barsFetchMemo = new Map(); // symbol -> ts of last remote fetch
+
+async function getBarsRange(symbol, rangeDays = 365) {
+  const have = db.prepare('SELECT COUNT(*) AS c, MIN(ts) AS minTs, MAX(ts) AS maxTs FROM bars WHERE symbol = ?').get(symbol);
+  const lastFetch = barsFetchMemo.get(symbol) || 0;
+  const wantFrom = Date.now() - rangeDays * 86400000;
+  const needRemote = (Date.now() - lastFetch > 12 * 3600 * 1000 && (!have.maxTs || Date.now() - have.maxTs > 36 * 3600 * 1000))
+    || !have.c || (have.minTs > wantFrom + 30 * 86400000);
+  if (needRemote) {
+    const range = rangeDays > 400 ? '2y' : rangeDays > 200 ? '1y' : '6mo';
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=${range}`;
+    const data = await fetchJson(url, { Accept: 'application/json' });
+    const r = data?.chart?.result?.[0];
+    const q = r?.indicators?.quote?.[0];
+    if (q?.close) {
+      const ins = db.prepare('INSERT OR REPLACE INTO bars (symbol, ts, o, h, l, c) VALUES (?, ?, ?, ?, ?, ?)');
+      for (let i = 0; i < q.close.length; i++) {
+        if ([q.open[i], q.high[i], q.low[i], q.close[i]].every(Number.isFinite)) {
+          ins.run(symbol, r.timestamp[i] * 1000, q.open[i], q.high[i], q.low[i], q.close[i]);
+        }
+      }
+      barsFetchMemo.set(symbol, Date.now());
+    }
+  }
+  return db.prepare('SELECT ts, o, h, l, c FROM bars WHERE symbol = ? AND ts >= ? ORDER BY ts').all(symbol, wantFrom);
+}
+
+// Where the technical rules would have fired, bar by bar. Mirrors scanTechnicals.
+function detectTechSignals(bars, rules) {
+  const closes = bars.map((b) => b.c);
+  const e5 = emaSeries(closes, 5);
+  const e20 = emaSeries(closes, 20);
+  const out = [];
+  for (let i = 30; i < bars.length - 1; i++) {
+    if (rules.includes('ma-cross')) {
+      const nowAbove = e5[i] > e20[i];
+      if (nowAbove !== (e5[i - 1] > e20[i - 1])) out.push({ i, rule: 'ma-cross', direction: nowAbove ? 'long' : 'short' });
+    }
+    if (rules.includes('rsi-reversal')) {
+      const r2 = rsiLast(closes.slice(Math.max(0, i - 62), i + 1), 2);
+      if (r2 != null && (r2 < 10 || r2 > 90)) out.push({ i, rule: 'rsi-reversal', direction: r2 < 10 ? 'long' : 'short' });
+    }
+    if (rules.includes('breakout-20')) {
+      let hi = -Infinity, lo = Infinity;
+      for (let k = i - 20; k < i; k++) {
+        if (bars[k].h > hi) hi = bars[k].h;
+        if (bars[k].l < lo) lo = bars[k].l;
+      }
+      if (closes[i] > hi) out.push({ i, rule: 'breakout-20', direction: 'long' });
+      else if (closes[i] < lo) out.push({ i, rule: 'breakout-20', direction: 'short' });
+    }
+  }
+  return out;
+}
+
+// One trade, simulated honestly on daily bars: signal at bar i's close, entry
+// at bar i+1's OPEN (never the signal close), gap-aware stop/target checks,
+// and when both stop and target sit inside one bar we assume the STOP hit
+// first (conservative).
+function simulateTrade(bars, i, direction, variant, rule, symbol, frictionOn = true) {
+  const dir = direction === 'short' ? -1 : 1;
+  const entryBar = bars[i + 1];
+  if (!entryBar) return null;
+  const fric = (price, isEntry) => (frictionOn ? applyFriction(symbol, direction, price, isEntry) : price);
+  const win = bars.slice(Math.max(0, i - 4), i + 1);
+  const adr = clamp(win.reduce((s, b) => s + (b.h - b.l) / b.c, 0) / win.length, 0.008, 0.06);
+  const rawEntry = entryBar.o;
+  const entry = fric(rawEntry, true);
+  const stopDist = rawEntry * clamp(variant.stopAdr * adr, 0.01, 0.08);
+  const stop = entry - dir * stopDist;
+  const target = entry + dir * variant.targetR * stopDist;
+  const horizonDays = Math.max(1, Math.round((RULE_HORIZON_DAYS[rule] ?? 2) * variant.horizonMult));
+  const fin = (reason, rawExit, ts, stillOpen = false) => {
+    const exit = fric(rawExit, false);
+    return {
+      openedAt: entryBar.ts, closedAt: ts, entry, exit, reason, stillOpen, stopDist,
+      pnlPerShare: (exit - entry) * dir,
+      frictionPerShare: frictionOn ? Math.abs(entry - rawEntry) + Math.abs(exit - rawExit) : 0,
+    };
+  };
+  for (let j = i + 1; j < bars.length; j++) {
+    const b = bars[j];
+    if (j > i + 1) {
+      // Overnight gaps fill at the open: through the stop that is worse than
+      // the stop, through the target it is better (a resting limit order).
+      if (dir === 1 ? b.o <= stop : b.o >= stop) return fin('stop hit (gap)', b.o, b.ts);
+      if (dir === 1 ? b.o >= target : b.o <= target) return fin('target hit (gap)', b.o, b.ts);
+    }
+    if (dir === 1 ? b.l <= stop : b.h >= stop) return fin('stop hit', stop, b.ts);
+    if (dir === 1 ? b.h >= target : b.l <= target) return fin('target hit', target, b.ts);
+    if (j - (i + 1) >= horizonDays) return fin('time exit', b.c, b.ts);
+  }
+  const lastB = bars[bars.length - 1];
+  return fin('still open at range end', lastB.c, lastB.ts, true);
+}
+
+// Sequential $100k account per rule: 1% risk sizing on running equity, 15%
+// notional cap — the same arithmetic the live autopilot uses.
+function accountSim(trades, base = 100000) {
+  const sorted = [...trades].sort((a, b) => a.openedAt - b.openedAt);
+  let equity = base, peak = base, maxDD = 0, wins = 0, grossWin = 0, grossLoss = 0, friction = 0, taken = 0;
+  const curve = [{ ts: sorted.length ? sorted[0].openedAt : Date.now(), balance: base }];
+  for (const t of sorted) {
+    let qty = Math.floor((equity * 0.01) / t.stopDist);
+    qty = Math.min(qty, Math.floor((equity * MAX_POSITION_FRACTION) / t.entry));
+    if (qty < 1) { if (t.stopDist <= equity * 0.02) qty = 1; else { t.qty = 0; continue; } }
+    t.qty = qty;
+    t.pnl = t.pnlPerShare * qty;
+    equity += t.pnl;
+    friction += t.frictionPerShare * qty;
+    taken++;
+    if (t.pnl > 0) { wins++; grossWin += t.pnl; } else grossLoss += -t.pnl;
+    if (equity > peak) peak = equity;
+    if (equity - peak < maxDD) maxDD = equity - peak;
+    curve.push({ ts: t.closedAt, balance: equity });
+  }
+  const ds = curve.length > 600 ? curve.filter((_, i) => i % Math.ceil(curve.length / 600) === 0).concat([curve[curve.length - 1]]) : curve;
+  return {
+    trades: taken, pnl: equity - base, endEquity: equity,
+    winRate: taken ? wins / taken : null,
+    profitFactor: grossLoss > 0 ? grossWin / grossLoss : (grossWin > 0 ? Infinity : null),
+    maxDrawdown: maxDD,
+    frictionPaid: friction,
+    avgHoldDays: taken ? sorted.reduce((s, t) => s + (t.qty ? (t.closedAt - t.openedAt) / 86400000 : 0), 0) / taken : null,
+    curve: ds,
+    tradeLog: sorted.filter((t) => t.qty).slice(-300).map((t) => ({
+      symbol: t.symbol, side: t.direction, openedAt: t.openedAt, closedAt: t.closedAt,
+      entry: +t.entry.toFixed(4), exit: +t.exit.toFixed(4), qty: t.qty, pnl: +t.pnl.toFixed(2), reason: t.reason,
+    })),
+  };
+}
+
+const TECH_RULES = ['ma-cross', 'rsi-reversal', 'breakout-20'];
+
+async function runTechnicalBacktest(opts = {}) {
+  const rules = (opts.rules || []).filter((r) => TECH_RULES.includes(r));
+  const useRules = rules.length ? rules : TECH_RULES;
+  const symbols = (opts.symbols || []).map((s) => String(s).toUpperCase()).filter((s) => /^[A-Z^.-]{1,10}$/.test(s));
+  const useSymbols = symbols.length ? symbols.slice(0, 24) : TECH_UNIVERSE;
+  const variantName = STRATEGY_VARIANTS[opts.variant] ? opts.variant : 'base';
+  const rangeDays = clamp(Number(opts.rangeDays) || 365, 60, 730);
+  const frictionOn = opts.friction !== false;
+  const perRule = Object.fromEntries(useRules.map((r) => [r, []]));
+  const errors = [];
+  for (const sym of useSymbols) {
+    let bars;
+    try { bars = await getBarsRange(sym, rangeDays); } catch (err) { errors.push(`${sym}: ${err.message}`); continue; }
+    if (bars.length < 40) { errors.push(`${sym}: only ${bars.length} bars`); continue; }
+    const busy = {}; // rule -> busy-until ts (one open position per symbol per rule, like live)
+    for (const s of detectTechSignals(bars, useRules)) {
+      if (bars[s.i].ts < (busy[s.rule] || 0)) continue;
+      const t = simulateTrade(bars, s.i, s.direction, STRATEGY_VARIANTS[variantName], s.rule, sym, frictionOn);
+      if (!t || t.stillOpen) continue;
+      busy[s.rule] = t.closedAt;
+      perRule[s.rule].push({ ...t, symbol: sym, direction: s.direction });
+    }
+  }
+  const results = {};
+  for (const rule of useRules) results[rule] = accountSim(perRule[rule]);
+  return { mode: 'technical', variant: variantName, rangeDays, friction: frictionOn, symbols: useSymbols, rules: useRules, base: 100000, errors, results };
+}
+
+// Replay every recorded live signal (event + technical families) against the
+// bars that followed it. Young today; more decisive every week the engine runs.
+async function replayRecordedSignals(opts = {}) {
+  const variantName = STRATEGY_VARIANTS[opts.variant] ? opts.variant : 'base';
+  const frictionOn = opts.friction !== false;
+  const rows = db.prepare("SELECT * FROM signals WHERE direction IN ('long','short') ORDER BY created_at").all();
+  const perRule = {};
+  const errors = [];
+  for (const s of rows) {
+    try {
+      const ageDays = Math.ceil((Date.now() - s.created_at) / 86400000) + 40;
+      const bars = await getBarsRange(s.tv_symbol, Math.min(730, Math.max(90, ageDays)));
+      let i = bars.findIndex((b) => b.ts > s.created_at) - 1;
+      if (i < 5 || i + 1 >= bars.length) continue; // signal too recent — no next bar yet
+      const t = simulateTrade(bars, i, s.direction, STRATEGY_VARIANTS[variantName], s.rule, s.tv_symbol, frictionOn);
+      if (!t || t.stillOpen) continue;
+      (perRule[s.rule] ??= []).push({ ...t, symbol: s.tv_symbol, direction: s.direction });
+    } catch (err) {
+      errors.push(`${s.tv_symbol}: ${err.message}`);
+    }
+  }
+  const results = {};
+  for (const [rule, trades] of Object.entries(perRule)) results[rule] = accountSim(trades);
+  return { mode: 'signals', variant: variantName, friction: frictionOn, base: 100000, signalCount: rows.length, errors: errors.slice(0, 10), results };
+}
+
+// Counterfactual scoring for signals the autopilot did NOT take — the cheapest
+// honest answer to "is the gating saving or costing money?"
+async function scoreUntakenSignals() {
+  const rows = db.prepare(`SELECT * FROM signals WHERE outcome_pnl IS NULL AND direction IN ('long','short')
+    AND status IN ('expired', 'dismissed', 'skipped') AND created_at < ? LIMIT 15`).all(Date.now() - 3 * 86400000);
+  for (const s of rows) {
+    try {
+      const bars = await getBarsRange(s.tv_symbol, 90);
+      let i = bars.findIndex((b) => b.ts > s.created_at) - 1;
+      if (i < 5 || i + 1 >= bars.length) continue;
+      const t = simulateTrade(bars, i, s.direction, STRATEGY_VARIANTS.base, s.rule, s.tv_symbol, true);
+      if (!t || t.stillOpen) continue;
+      const qty = s.plan_qty || Math.max(1, Math.floor(10000 / t.entry));
+      db.prepare('UPDATE signals SET outcome_pnl = ?, outcome_note = ? WHERE id = ?')
+        .run(+(t.pnlPerShare * qty).toFixed(2), `would-have-been: ${t.reason} after ${((t.closedAt - t.openedAt) / 86400000).toFixed(1)}d`, s.id);
+    } catch { /* retry next pass */ }
+  }
 }
 
 // ---------------------------------------------------------------- static files
@@ -1375,6 +1913,7 @@ function serveStatic(res, urlPath) {
   let rel = urlPath === '/' ? 'index.html' : urlPath.replace(/^\/+/, '');
   if (rel === 'trades') rel = 'trades.html';
   if (rel === 'strategies') rel = 'strategies.html';
+  if (rel === 'backtest') rel = 'backtest.html';
   const file = path.normalize(path.join(PUBLIC_DIR, rel));
   if (!file.startsWith(PUBLIC_DIR)) { res.writeHead(403); res.end(); return; }
   fs.readFile(file, (err, buf) => {
@@ -1417,8 +1956,9 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { signals: rows.map((r) => ({ ...r, symbols: JSON.parse(r.symbols), event: r.event_json ? JSON.parse(r.event_json) : null })) });
     }
     if (p === '/api/signals/dismiss' && req.method === 'POST') {
-      const { id } = await readBody(req);
-      db.prepare("UPDATE signals SET status = 'dismissed' WHERE id = ?").run(String(id));
+      const { id, undo } = await readBody(req);
+      if (undo) db.prepare("UPDATE signals SET status = 'new' WHERE id = ? AND status = 'dismissed'").run(String(id));
+      else db.prepare("UPDATE signals SET status = 'dismissed' WHERE id = ? AND status = 'new'").run(String(id));
       return json(res, 200, { ok: true });
     }
     if (p === '/api/quotes' && req.method === 'GET') {
@@ -1427,36 +1967,49 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { quotes: await getQuotes(symbols) });
     }
     if (p === '/api/trades' && req.method === 'GET') {
-      // Summary spans ALL trades; the returned list is capped — scalper volume
-      // would otherwise grow this payload without bound (CSV has everything).
+      // Summary aggregates run in SQL; the row list is capped in SQL too —
+      // the old version loaded the whole table per request while the scalper
+      // grows it by hundreds of rows a day.
       const limitRaw = Number(url.searchParams.get('limit'));
       const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 5000) : 400;
-      const trades = db.prepare('SELECT * FROM trades ORDER BY opened_at DESC').all();
-      const openSymbols = [...new Set(trades.filter((t) => t.status === 'open').map((t) => t.symbol))];
-      const quotes = openSymbols.length ? await getQuotes(openSymbols) : {};
-      const enriched = trades.map((t) => {
+      const openRows = db.prepare("SELECT * FROM trades WHERE status = 'open' ORDER BY opened_at DESC").all();
+      const closedRows = db.prepare("SELECT * FROM trades WHERE status = 'closed' ORDER BY opened_at DESC LIMIT ?").all(limit);
+      const quotes = openRows.length ? await getQuotes([...new Set(openRows.map((t) => t.symbol))]) : {};
+      const enrich = (t) => {
         const q = quotes[t.symbol];
         const pnl = tradePnl(t, q?.price);
         return { ...t, mark: t.status === 'closed' ? t.exit_price : q?.price ?? null, pnl };
-      });
-      const open = enriched.filter((t) => t.status === 'open');
-      const closed = enriched.filter((t) => t.status === 'closed');
-      const realized = closed.reduce((s, t) => s + (t.pnl ?? 0), 0);
+      };
+      const open = openRows.map(enrich);
+      const agg = db.prepare(`SELECT COUNT(*) AS closedCount,
+          COALESCE(SUM(${AUTO_PNL_SQL}), 0) AS realized,
+          SUM(CASE WHEN ${AUTO_PNL_SQL} > 0 THEN 1 ELSE 0 END) AS wins,
+          COALESCE(SUM(CASE WHEN auto = 1 THEN ${AUTO_PNL_SQL} END), 0) AS autoRealized,
+          SUM(CASE WHEN auto = 1 THEN 1 ELSE 0 END) AS autoClosed,
+          COALESCE(SUM(fees), 0) AS fees
+        FROM trades WHERE status = 'closed'`).get();
       const unrealized = open.reduce((s, t) => s + (t.pnl ?? 0), 0);
-      const wins = closed.filter((t) => (t.pnl ?? 0) > 0).length;
-      const autoTrades = enriched.filter((t) => t.auto);
+      const autoOpen = open.filter((t) => t.auto);
+      const todayRealized = db.prepare(`SELECT COALESCE(SUM(${AUTO_PNL_SQL}), 0) AS s, COUNT(*) AS c FROM trades WHERE status = 'closed' AND closed_at >= ?`)
+        .get(etDayStart(Date.now()));
+      const trades = [...open, ...closedRows.map(enrich)].sort((a, b) => b.opened_at - a.opened_at).slice(0, limit);
       return json(res, 200, {
-        trades: enriched.slice(0, limit),
-        total: enriched.length,
+        trades,
+        total: agg.closedCount + open.length,
         summary: {
-          openCount: open.length, closedCount: closed.length,
-          realized, unrealized,
-          equity: STARTING_EQUITY + realized + unrealized,
+          openCount: open.length, closedCount: agg.closedCount,
+          realized: agg.realized, unrealized,
+          equity: STARTING_EQUITY + agg.realized + unrealized,
           startingEquity: STARTING_EQUITY,
-          winRate: closed.length ? wins / closed.length : null,
+          winRate: agg.closedCount ? agg.wins / agg.closedCount : null,
           autopilot: autopilotOn,
-          claudePnl: autoTrades.reduce((s, t) => s + (t.pnl ?? 0), 0),
-          claudeCount: autoTrades.length,
+          claudePnl: agg.autoRealized + autoOpen.reduce((s, t) => s + (t.pnl ?? 0), 0),
+          claudeCount: agg.autoClosed + autoOpen.length,
+          todayRealized: todayRealized.s, todayTrades: todayRealized.c,
+          feesPaid: agg.fees,
+          grossExposure: open.reduce((s, t) => s + t.entry_price * t.qty, 0),
+          marketOpen: usMarketOpen(),
+          killSwitch: killSwitchActive(),
         },
       });
     }
@@ -1493,19 +2046,47 @@ const server = http.createServer(async (req, res) => {
       });
     }
     if (p === '/api/evolution' && req.method === 'GET') {
+      // The active generation's row shows its RUNNING record, not dashes —
+      // otherwise there is no way to judge the current lesson against history.
+      const liveStats = db.prepare(`SELECT variant, COUNT(*) AS trades, COALESCE(SUM(${AUTO_PNL_SQL}), 0) AS pnl,
+          SUM(CASE WHEN ${AUTO_PNL_SQL} > 0 THEN 1 ELSE 0 END) AS wins
+        FROM trades WHERE status = 'closed' AND strategy = ? GROUP BY variant`).all(SCALP_RULE);
+      const liveByGen = new Map(liveStats.map((r) => [r.variant, r]));
       return json(res, 200, {
         generations: db.prepare('SELECT * FROM strategy_params ORDER BY rule, gen').all()
-          .map((r) => ({ ...r, params: JSON.parse(r.params) })),
+          .map((r) => {
+            const out = { ...r, params: JSON.parse(r.params) };
+            if (r.status === 'active') {
+              const live = liveByGen.get(`g${r.gen}`);
+              if (live) { out.trades = live.trades; out.pnl = live.pnl; out.win_rate = live.trades ? live.wins / live.trades : null; }
+            }
+            return out;
+          }),
         tuning: db.prepare('SELECT * FROM rule_tuning ORDER BY rule').all(),
+        tuningHistory: db.prepare('SELECT * FROM rule_tuning_history ORDER BY id DESC LIMIT 100').all(),
         log: db.prepare("SELECT * FROM activity WHERE kind = 'evolve' ORDER BY id DESC LIMIT 50").all(),
       });
     }
+    if (p === '/api/benchmark' && req.method === 'GET') {
+      // SPY buy-and-hold from the same start, scaled to $100k — the honest
+      // "what if we did nothing" line for the strategy accounts.
+      const daysRaw = Number(url.searchParams.get('days'));
+      const days = Number.isFinite(daysRaw) && daysRaw > 0 ? Math.min(daysRaw, 730) : 90;
+      const bars = await getBarsRange('SPY', days);
+      if (!bars.length) return json(res, 200, { curve: [] });
+      const base = 100000 / bars[0].c;
+      return json(res, 200, { symbol: 'SPY', curve: bars.map((b) => ({ ts: b.ts, balance: +(b.c * base).toFixed(2) })) });
+    }
     if (p === '/api/daily-pnl' && req.method === 'GET') {
-      return json(res, 200, {
-        days: db.prepare(`SELECT strftime('%Y-%m-%d', closed_at / 1000, 'unixepoch') AS day,
-            COALESCE(SUM(${AUTO_PNL_SQL}), 0) AS pnl, COUNT(*) AS trades
-          FROM trades WHERE status = 'closed' GROUP BY day ORDER BY day`).all(),
-      });
+      const rule = url.searchParams.get('rule');
+      const days = rule
+        ? db.prepare(`SELECT strftime('%Y-%m-%d', closed_at / 1000, 'unixepoch') AS day,
+              COALESCE(SUM(${AUTO_PNL_SQL}), 0) AS pnl, COUNT(*) AS trades
+            FROM trades WHERE status = 'closed' AND strategy = ? GROUP BY day ORDER BY day`).all(rule)
+        : db.prepare(`SELECT strftime('%Y-%m-%d', closed_at / 1000, 'unixepoch') AS day,
+              COALESCE(SUM(${AUTO_PNL_SQL}), 0) AS pnl, COUNT(*) AS trades
+            FROM trades WHERE status = 'closed' GROUP BY day ORDER BY day`).all();
+      return json(res, 200, { days });
     }
     if (p === '/api/stream' && req.method === 'GET') {
       res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
@@ -1567,7 +2148,14 @@ const server = http.createServer(async (req, res) => {
     }
     if (p === '/api/settings' && req.method === 'GET') {
       const mask = (k) => (k ? `••••••••${k.slice(-4)}` : '');
-      return json(res, 200, { aisstream_key: mask(aisKey), wm_api_key: mask(wmKey), scalper: scalperOn });
+      return json(res, 200, {
+        aisstream_key: mask(aisKey), wm_api_key: mask(wmKey), scalper: scalperOn,
+        webhook_url: webhookUrl,
+        risk_per_trade: RISK_PER_TRADE * 100,
+        max_positions: MAX_OPEN_POSITIONS,
+        scalp_fee_bps: SCALP.feeBps,
+        scalp_notional: SCALP.notional,
+      });
     }
     if (p === '/api/settings' && req.method === 'POST') {
       const b = await readBody(req);
@@ -1600,8 +2188,64 @@ const server = http.createServer(async (req, res) => {
         setSetting('wm_api_key', '');
         logActivity('info', 'WorldMonitor API key removed');
       }
+      if (typeof b.webhook_url === 'string') {
+        webhookUrl = b.webhook_url.trim();
+        setSetting('webhook_url', webhookUrl);
+        if (webhookUrl) {
+          logActivity('info', 'Notification webhook saved — alerts will POST there (fills digest, kill switch, evolutions)');
+          notify('world-trader connected', 'Notifications are working. You will get evolution lessons, kill-switch alerts, and a daily digest here.');
+        } else logActivity('info', 'Notification webhook removed');
+      }
+      if (Number.isFinite(Number(b.risk_per_trade)) && Number(b.risk_per_trade) > 0) {
+        RISK_PER_TRADE = clamp(Number(b.risk_per_trade) / 100, 0.001, 0.05);
+        setSetting('risk_per_trade', String(RISK_PER_TRADE * 100));
+        logActivity('info', `Risk per trade set to ${(RISK_PER_TRADE * 100).toFixed(2)}% of equity`);
+      }
+      if (Number.isFinite(Number(b.max_positions)) && Number(b.max_positions) > 0) {
+        MAX_OPEN_POSITIONS = clamp(Math.round(Number(b.max_positions)), 1, 30);
+        setSetting('max_positions', String(MAX_OPEN_POSITIONS));
+        logActivity('info', `Max open positions set to ${MAX_OPEN_POSITIONS}`);
+      }
+      if (Number.isFinite(Number(b.scalp_fee_bps))) {
+        SCALP.feeBps = clamp(Number(b.scalp_fee_bps), 0, 50);
+        setSetting('scalp_fee_bps', String(SCALP.feeBps));
+        logActivity('info', `Scalper fee model set to ${SCALP.feeBps} bps per side`);
+      }
+      if (Number.isFinite(Number(b.scalp_notional)) && Number(b.scalp_notional) > 0) {
+        SCALP.notional = clamp(Number(b.scalp_notional), 100, 50000);
+        setSetting('scalp_notional', String(SCALP.notional));
+        logActivity('info', `Scalper notional set to $${SCALP.notional} per position`);
+      }
       const mask = (k) => (k ? `••••••••${k.slice(-4)}` : '');
       return json(res, 200, { ok: true, aisstream_key: mask(aisKey), wm_api_key: mask(wmKey) });
+    }
+    if (p === '/api/health' && req.method === 'GET') {
+      return json(res, 200, {
+        ok: true,
+        uptimeSec: Math.round((Date.now() - bootTs) / 1000),
+        autopilot: autopilotOn, scalper: scalperOn,
+        marketOpen: usMarketOpen(), killSwitch: killSwitchActive(),
+        equity: lastMarkedEquity.equity,
+        lastEventRefresh: eventCache.fetchedAt, feedErrors: eventCache.errors,
+        sseClients: sseClients.size,
+        scalpGen, scalpParams: { ...scalpBase, feeBps: SCALP.feeBps },
+        wakeGraceUntil,
+      });
+    }
+    if (p === '/api/export.json' && req.method === 'GET') {
+      const dump = {
+        exportedAt: new Date().toISOString(),
+        startingEquity: STARTING_EQUITY,
+        trades: db.prepare('SELECT * FROM trades ORDER BY opened_at').all(),
+        signals: db.prepare('SELECT * FROM signals ORDER BY created_at').all(),
+        equity: db.prepare('SELECT * FROM equity_snapshots ORDER BY ts').all(),
+        generations: db.prepare('SELECT * FROM strategy_params ORDER BY rule, gen').all(),
+        tuning: db.prepare('SELECT * FROM rule_tuning ORDER BY rule').all(),
+        tuningHistory: db.prepare('SELECT * FROM rule_tuning_history ORDER BY id').all(),
+        activity: db.prepare('SELECT * FROM activity ORDER BY id').all(),
+      };
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Disposition': 'attachment; filename="world-trader-export.json"' });
+      return res.end(JSON.stringify(dump));
     }
     if (p === '/api/equity-history' && req.method === 'GET') {
       return json(res, 200, {
@@ -1628,9 +2272,24 @@ const server = http.createServer(async (req, res) => {
           SUM(CASE WHEN status = 'closed' AND ${AUTO_PNL_SQL} > 0 THEN 1 ELSE 0 END) AS wins,
           COALESCE(SUM(CASE WHEN status = 'closed' THEN ${AUTO_PNL_SQL} END), 0) AS realized,
           COALESCE(SUM(CASE WHEN status = 'closed' AND ${AUTO_PNL_SQL} > 0 THEN ${AUTO_PNL_SQL} END), 0) AS grossWin,
-          COALESCE(SUM(CASE WHEN status = 'closed' AND ${AUTO_PNL_SQL} < 0 THEN ${AUTO_PNL_SQL} END), 0) AS grossLoss
+          COALESCE(SUM(CASE WHEN status = 'closed' AND ${AUTO_PNL_SQL} < 0 THEN ${AUTO_PNL_SQL} END), 0) AS grossLoss,
+          COALESCE(SUM(CASE WHEN status = 'closed' THEN fees END), 0) AS fees,
+          AVG(CASE WHEN status = 'closed' THEN closed_at - opened_at END) AS avgHoldMs,
+          AVG(CASE WHEN status = 'closed' AND ${AUTO_PNL_SQL} > 0 THEN ${AUTO_PNL_SQL} END) AS avgWin,
+          AVG(CASE WHEN status = 'closed' AND ${AUTO_PNL_SQL} < 0 THEN ${AUTO_PNL_SQL} END) AS avgLoss,
+          AVG(CASE WHEN status = 'closed' THEN mfe END) AS avgMfe,
+          AVG(CASE WHEN status = 'closed' THEN mae END) AS avgMae
         FROM trades WHERE auto = 1 GROUP BY strategy, variant ORDER BY realized DESC`).all();
-      return json(res, 200, { performance: rows });
+      // Max drawdown per strategy from the realized P&L sequence.
+      const seq = db.prepare(`SELECT strategy, ${AUTO_PNL_SQL} AS pnl FROM trades WHERE status = 'closed' AND auto = 1 ORDER BY closed_at`).all();
+      const dd = {}, cum = {}, peak = {};
+      for (const r of seq) {
+        const k = r.strategy || 'manual';
+        cum[k] = (cum[k] || 0) + r.pnl;
+        peak[k] = Math.max(peak[k] ?? 0, cum[k]);
+        dd[k] = Math.min(dd[k] ?? 0, cum[k] - peak[k]);
+      }
+      return json(res, 200, { performance: rows, drawdowns: dd });
     }
     if (p === '/api/activity' && req.method === 'GET') {
       return json(res, 200, { activity: db.prepare('SELECT * FROM activity ORDER BY id DESC LIMIT 100').all() });
@@ -1650,9 +2309,13 @@ const server = http.createServer(async (req, res) => {
       const qty = Number(b.qty);
       if (!symbol || !Number.isFinite(qty) || qty <= 0) return json(res, 400, { error: 'symbol and positive qty required' });
       let entry = Number(b.entry_price);
+      const live = await getQuote(symbol).catch(() => null);
       if (!Number.isFinite(entry) || entry <= 0) {
-        const q = await getQuote(symbol);
-        entry = q.price;
+        if (!live || live.stale || !Number.isFinite(live.price)) return json(res, 400, { error: `no fresh quote for ${symbol} — market order unavailable right now` });
+        entry = applyFriction(symbol, side, live.price, true);
+      } else if (live && Number.isFinite(live.price) && Math.abs(entry - live.price) / live.price > 0.05) {
+        // Fabricated off-market fills would flow straight into headline equity.
+        return json(res, 400, { error: `entry ${entry} is >5% from the live price ${live.price.toFixed(2)} — fills must be near the market` });
       }
       const stop = Number.isFinite(Number(b.stop_price)) && Number(b.stop_price) > 0 ? Number(b.stop_price) : null;
       const target = Number.isFinite(Number(b.target_price)) && Number(b.target_price) > 0 ? Number(b.target_price) : null;
@@ -1669,12 +2332,37 @@ const server = http.createServer(async (req, res) => {
       if (!t) return json(res, 404, { error: 'trade not found' });
       if (t.status === 'closed') return json(res, 400, { error: 'already closed' });
       let exit = Number(b.exit_price);
+      const live = await getQuote(t.symbol).catch(() => null);
       if (!Number.isFinite(exit) || exit <= 0) {
-        const q = await getQuote(t.symbol);
-        exit = q.price;
+        if (!live || live.stale || !Number.isFinite(live.price)) return json(res, 400, { error: `no fresh quote for ${t.symbol} — try again shortly` });
+        exit = applyFriction(t.symbol, t.side, live.price, false);
+      } else if (live && Number.isFinite(live.price) && Math.abs(exit - live.price) / live.price > 0.05) {
+        return json(res, 400, { error: `exit ${exit} is >5% from the live price ${live.price.toFixed(2)} — fills must be near the market` });
       }
       closeTrade(t, exit, 'manual close');
       return json(res, 200, { ok: true, exit_price: exit });
+    }
+    if (p === '/api/backtest' && req.method === 'POST') {
+      const b = await readBody(req);
+      const result = b.mode === 'signals' ? await replayRecordedSignals(b) : await runTechnicalBacktest(b);
+      const info = db.prepare('INSERT INTO backtests (created_at, label, params, results) VALUES (?, ?, ?, ?)')
+        .run(Date.now(), String(b.label || '').slice(0, 80) || null,
+          JSON.stringify({ mode: b.mode || 'technical', rules: b.rules, symbols: b.symbols, rangeDays: b.rangeDays, variant: b.variant, friction: b.friction }),
+          JSON.stringify(result));
+      logActivity('info', `Backtest #${info.lastInsertRowid} complete — ${result.mode} mode, ${Object.keys(result.results).length} strategies scored`);
+      return json(res, 200, { id: Number(info.lastInsertRowid), created_at: Date.now(), ...result });
+    }
+    if (p === '/api/backtests' && req.method === 'GET') {
+      const id = Number(url.searchParams.get('id'));
+      if (Number.isFinite(id) && id > 0) {
+        const row = db.prepare('SELECT * FROM backtests WHERE id = ?').get(id);
+        if (!row) return json(res, 404, { error: 'backtest not found' });
+        return json(res, 200, { id: row.id, created_at: row.created_at, label: row.label, params: JSON.parse(row.params), ...JSON.parse(row.results) });
+      }
+      return json(res, 200, {
+        backtests: db.prepare('SELECT id, created_at, label, params FROM backtests ORDER BY id DESC LIMIT 50').all()
+          .map((r) => ({ ...r, params: JSON.parse(r.params) })),
+      });
     }
     if (p === '/api/config' && req.method === 'GET') {
       return json(res, 200, { wmKeyPresent: Boolean(wmKey), port: PORT, refreshMs: EVENT_REFRESH_MS, autopilot: autopilotOn });
@@ -1687,8 +2375,36 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => {
-  console.log(`world-trader listening on http://localhost:${PORT}  (paper trading only — no real money · autopilot ${autopilotOn ? 'ON' : 'OFF'})`);
+// ---- daily digest (just after the US close) ----
+let digestDay = '';
+function maybeDailyDigest() {
+  const pnow = etNow();
+  if (pnow.weekend || pnow.minutes < 16 * 60 + 5 || digestDay === pnow.day) return;
+  digestDay = pnow.day;
+  const t = db.prepare(`SELECT COUNT(*) AS c, COALESCE(SUM(${AUTO_PNL_SQL}), 0) AS pnl FROM trades WHERE status = 'closed' AND closed_at >= ?`)
+    .get(etDayStart(Date.now()));
+  const openC = db.prepare("SELECT COUNT(*) AS c FROM trades WHERE status = 'open'").get().c;
+  const msg = `Today: ${t.pnl >= 0 ? '+' : ''}$${t.pnl.toFixed(2)} over ${t.c} closed trades · ${openC} open · equity ${lastMarkedEquity.equity ? '$' + lastMarkedEquity.equity.toFixed(0) : '—'}`;
+  logActivity('info', `Daily digest — ${msg}`);
+  notify('world-trader daily digest', msg);
+}
+
+// ---- nightly maintenance: checkpoint, backup, prune tick candles ----
+function nightlyMaintenance() {
+  try {
+    db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+    const dir = path.join(ROOT, 'backups');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.copyFileSync(path.join(ROOT, 'data.db'), path.join(dir, `data-${new Date().toISOString().slice(0, 10)}.db`));
+    const files = fs.readdirSync(dir).filter((f) => f.startsWith('data-')).sort();
+    while (files.length > 14) fs.unlinkSync(path.join(dir, files.shift()));
+    db.prepare('DELETE FROM candles WHERE ts < ?').run(Date.now() - 30 * 86400000);
+    console.log('[maint] WAL checkpoint + backup complete');
+  } catch (e) { console.error('[maint] failed:', e.message); }
+}
+
+server.listen(PORT, HOST, () => {
+  console.log(`world-trader listening on http://${HOST}:${PORT}  (paper trading only — no real money · autopilot ${autopilotOn ? 'ON' : 'OFF'} · market ${usMarketOpen() ? 'OPEN' : 'closed'})`);
   refreshEvents()
     .then(() => autopilotTick())
     .catch((e) => console.error('[events] initial refresh failed:', e.message));
@@ -1702,6 +2418,11 @@ server.listen(PORT, () => {
   setInterval(() => scalperTick(), SCALP.tickMs);
   setInterval(() => { try { evolveScalper(); } catch (e) { console.error('[evolve] scalper:', e.message); } }, 60 * 1000);
   setInterval(() => { try { evolveSlowRules(); } catch (e) { console.error('[evolve] rules:', e.message); } }, 6 * 3600 * 1000);
-  console.log(`[scalper] ${scalperOn ? 'active' : 'paused'} — ${Object.keys(SCALP_PAIRS).length} pairs streaming, decisions every ${SCALP.tickMs}ms${SCALP_TEST ? ' (TEST MODE)' : ''}`);
+  setInterval(heartbeat, 15 * 1000);
+  setInterval(maybeDailyDigest, 5 * 60 * 1000);
+  nightlyMaintenance();
+  setInterval(nightlyMaintenance, 24 * 3600 * 1000);
+  setInterval(() => scoreUntakenSignals().catch((e) => console.error('[score] failed:', e.message)), 3600 * 1000);
+  console.log(`[scalper] ${scalperOn ? 'active' : 'paused'} — ${Object.keys(SCALP_PAIRS).length} pairs streaming, decisions every ${SCALP.tickMs}ms, fees ${SCALP.feeBps}bps/side${SCALP_TEST ? ' (TEST MODE)' : ''}`);
   if (aisKey) startAisStream();
 });

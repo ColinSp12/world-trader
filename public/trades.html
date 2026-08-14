@@ -15,6 +15,7 @@
     <a href="/">Map</a>
     <a href="/trades" class="active">Trades</a>
     <a href="/strategies">Strategies</a>
+    <a href="/backtest">Backtest</a>
   </nav>
   <span class="status" id="status"></span>
   <button class="btn small" id="compact-toggle" title="toggle density">▤</button>
@@ -32,6 +33,24 @@
   <label class="set-field" style="display:flex; gap:8px; align-items:center">
     <input type="checkbox" id="set-scalper" style="width:auto">
     Crypto scalper active <span class="dim-note">(24/7 hyperactive day-trading account)</span>
+  </label>
+  <h3 style="margin-top:14px">Risk &amp; engine knobs</h3>
+  <div class="set-grid">
+    <label class="set-field">Risk per trade (%)
+      <input type="number" id="set-risk" min="0.1" max="5" step="0.1" placeholder="1">
+    </label>
+    <label class="set-field">Max open positions
+      <input type="number" id="set-maxpos" min="1" max="30" step="1" placeholder="10">
+    </label>
+    <label class="set-field">Scalper fee (bps/side)
+      <input type="number" id="set-feebps" min="0" max="50" step="0.5" placeholder="10">
+    </label>
+    <label class="set-field">Scalper notional ($)
+      <input type="number" id="set-notional" min="100" max="50000" step="100" placeholder="5000">
+    </label>
+  </div>
+  <label class="set-field">Notification webhook <span class="dim-note">(e.g. a free <a href="https://ntfy.sh" target="_blank" rel="noopener">ntfy.sh</a> topic URL — evolution lessons, kill-switch alerts, daily digest)</span>
+    <div class="set-row"><input type="text" id="set-webhook" placeholder="https://ntfy.sh/your-topic"><button class="btn small" id="clear-webhook">Clear</button></div>
   </label>
   <div class="set-actions">
     <button class="btn" id="close-settings">Close</button>
@@ -68,7 +87,12 @@
   <div class="tiles" id="tiles"></div>
 
   <section class="panel" id="signals-panel">
-    <h2>Suggested trades <span class="count" id="sig-count"></span></h2>
+    <h2>Suggested trades <span class="count" id="sig-count"></span>
+      <span class="tabbtns" id="signal-tabs" style="margin-left:auto">
+        <button data-v="new" class="active">Queue</button>
+        <button data-v="history">History</button>
+      </span>
+    </h2>
     <div class="scroll" id="signals"></div>
     <div class="note">The autopilot prices each signal into a plan (entry · stop · target · size · time exit), then opens and manages the paper trades itself. Experimental heuristics — not financial advice.</div>
   </section>
@@ -109,6 +133,12 @@
         <button data-f="open">Open</button>
         <button data-f="closed">Closed</button>
       </span>
+      <input type="text" id="blotter-sym" placeholder="symbol…" size="6" title="filter by symbol">
+      <select id="blotter-sort" title="sort trades">
+        <option value="time">Newest</option>
+        <option value="pnl">P&amp;L ↓</option>
+        <option value="pnl-asc">P&amp;L ↑</option>
+      </select>
       <a class="btn small" href="/api/trades.csv" style="margin-left:auto" download>Export CSV</a>
     </h2>
     <div class="scroll" id="blotter"></div>
