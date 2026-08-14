@@ -501,24 +501,27 @@ let autopilotOn = getSetting('autopilot', '1') === '1';
 const MAX_OPEN_POSITIONS = 8;
 const RISK_PER_TRADE = 0.01;         // 1% of equity at the stop
 const MAX_POSITION_FRACTION = 0.15;  // notional cap per position
+// Short-term regime: horizons of hours to 2 days, targets sized to be
+// reachable within that window (≤ ~3× a day's range).
 const RULE_HORIZON_DAYS = {
-  'quake-country-etf': 3, 'oil-producer-unrest': 5, 'chokepoint-disruption': 5,
-  'hurricane-energy': 4, 'global-risk-off': 5, 'headline-risk': 3,
+  'quake-country-etf': 1, 'oil-producer-unrest': 2, 'chokepoint-disruption': 2,
+  'hurricane-energy': 1.5, 'global-risk-off': 2, 'headline-risk': 1,
 };
 
 // Exit-style variants — each auto trade is tagged (strategy rule × variant) so
 // performance can be compared per combination and sizing adapted over time.
+// tight ≈ hours, base ≈ a day, runner ≈ 1–2 days.
 const STRATEGY_VARIANTS = {
-  tight:  { stopAdr: 1.0, targetR: 1.5, horizonMult: 0.6 },
-  base:   { stopAdr: 1.5, targetR: 2.0, horizonMult: 1.0 },
-  runner: { stopAdr: 2.0, targetR: 3.0, horizonMult: 1.5 },
+  tight:  { stopAdr: 0.6, targetR: 1.0, horizonMult: 0.3 },
+  base:   { stopAdr: 1.0, targetR: 1.5, horizonMult: 0.6 },
+  runner: { stopAdr: 1.4, targetR: 2.0, horizonMult: 1.0 },
 };
 
 async function buildPlan(direction, rule, symbol, v = STRATEGY_VARIANTS.base, sizeFactor = 1) {
   const q = await getQuote(symbol);
   const adr = Math.min(Math.max(q.adrPct ?? 0.02, 0.008), 0.06);
   const entry = q.price;
-  const stopDist = entry * Math.min(Math.max(v.stopAdr * adr, 0.012), 0.10);
+  const stopDist = entry * Math.min(Math.max(v.stopAdr * adr, 0.01), 0.06);
   const dir = direction === 'short' ? -1 : 1; // 'watch' plans as a long suggestion
   const stop = entry - dir * stopDist;
   const target = entry + dir * v.targetR * stopDist;

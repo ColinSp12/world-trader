@@ -11,14 +11,15 @@ API, so all fills are simulated locally.
 
 Every minute the engine:
 
-1. **Prices queued signals into plans** — entry at the live quote; stop at
-   ~1.5× the symbol's 5-day average daily range (clamped 1.5–8%); target at 2×
-   the stop distance (2R); size risking 1% of equity at the stop (halved when
-   VIX ≥ 30), capped at 15% of equity per position.
+1. **Prices queued signals into plans** — entry at the live quote; stop scaled
+   to the symbol's 5-day average daily range (clamped 1–6%); target at 1–2×
+   the stop distance depending on variant; size risking 1% of equity at the
+   stop (halved when VIX ≥ 30), capped at 15% of equity per position.
 2. **Enters** long/short signals automatically (max 8 open positions, one per
    symbol, signals fresher than 24h). `watch`-grade signals are suggestions
    only and are never auto-traded.
-3. **Exits** on stop hit, target hit, or the rule's time horizon (3–5 days).
+3. **Exits** on stop hit, target hit, or the rule's time horizon — the regime
+   is deliberately **short-term: hours to 2 days**.
 
 Everything it does is written to the activity feed on the Trades page, and the
 Pause button stops entries/exits at any time. Paper account starts at $100,000
@@ -29,11 +30,11 @@ Pause button stops entries/exits at any time. Paper account starts at $100,000
 Each auto trade is tagged with its signal rule **and** an exit-style variant,
 assigned sample-balanced so every combination gets tested:
 
-| Variant | Stop | Target | Horizon |
+| Variant | Stop | Target | Typical hold |
 |---|---|---|---|
-| `tight` | 1.0× ADR | 1.5R | 0.6× rule horizon |
-| `base` | 1.5× ADR | 2R | 1× |
-| `runner` | 2.0× ADR | 3R | 1.5× |
+| `tight` | 0.6× ADR | 1R | hours |
+| `base` | 1.0× ADR | 1.5R | ~1 day |
+| `runner` | 1.4× ADR | 2R | 1–2 days |
 
 The **Strategy performance** tab on the Trades page shows win rate, realized
 P&L, and profit factor per combination. Sizing adapts to results: a combo

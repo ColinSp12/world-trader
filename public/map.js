@@ -50,12 +50,61 @@ function updateFlightsToggle(counts) {
   btn.textContent = flightsOn ? `✈ aircraft${counts ? ` (${counts})` : ''}` : '✈ aircraft — off';
 }
 
+let shipSourceIsDemo = false;
 function updateShipsToggle(count, source) {
   const btn = document.getElementById('ships-toggle');
   if (!btn) return;
   btn.classList.toggle('off', !shipsOn);
-  if (source) btn.title = source;
-  btn.textContent = shipsOn ? `⚓ ships${count != null ? ` (${count})` : ''}` : '⚓ ships — off';
+  if (source) {
+    btn.title = source;
+    shipSourceIsDemo = source.includes('Digitraffic');
+  }
+  const demo = shipSourceIsDemo ? ' · Baltic demo' : '';
+  btn.textContent = shipsOn ? `⚓ ships${count != null ? ` (${count}${demo})` : ''}` : '⚓ ships — off';
+}
+
+// ---- day/night terminator (approximate solar position; visual only) ----
+const nightLayer = L.polygon([], { stroke: false, fillColor: '#000', fillOpacity: 0.24, interactive: false }).addTo(map);
+function updateTerminator() {
+  const now = new Date();
+  const dayOfYear = (Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()) - Date.UTC(now.getUTCFullYear(), 0, 0)) / 86400000;
+  const decl = (-23.44 * Math.cos((2 * Math.PI / 365) * (dayOfYear + 10))) || 0.01; // solar declination, deg
+  const utcFrac = (now.getUTCHours() * 3600 + now.getUTCMinutes() * 60 + now.getUTCSeconds()) / 86400;
+  const subsolarLon = 180 - utcFrac * 360;
+  const declRad = decl * Math.PI / 180;
+  const pts = [];
+  for (let lon = -180; lon <= 180; lon += 2) {
+    const hourAngle = (lon - subsolarLon) * Math.PI / 180;
+    pts.push([Math.atan(-Math.cos(hourAngle) / Math.tan(declRad)) * 180 / Math.PI, lon]);
+  }
+  const darkPole = decl > 0 ? -90 : 90;
+  pts.push([darkPole, 180], [darkPole, -180]);
+  nightLayer.setLatLngs(pts);
+}
+updateTerminator();
+setInterval(updateTerminator, 5 * 60 * 1000);
+
+// ---- shipping chokepoints (static, thematic anchors for the ships layer) ----
+const CHOKEPOINTS = [
+  { name: 'Strait of Hormuz', lat: 26.6, lon: 56.5, note: '~20% of global oil transits here', syms: 'USO · XLE' },
+  { name: 'Suez Canal', lat: 30.5, lon: 32.35, note: 'Asia–Europe shortcut', syms: 'ZIM · FRO' },
+  { name: 'Bab el-Mandeb', lat: 12.6, lon: 43.3, note: 'Red Sea southern gate', syms: 'FRO · USO' },
+  { name: 'Strait of Malacca', lat: 1.8, lon: 102.5, note: 'Asia’s main maritime artery', syms: 'FXI · EWS' },
+  { name: 'Panama Canal', lat: 9.08, lon: -79.68, note: 'Atlantic–Pacific link', syms: 'ZIM' },
+  { name: 'Bosporus', lat: 41.1, lon: 29.06, note: 'Black Sea grain & oil', syms: 'WEAT · USO' },
+  { name: 'Taiwan Strait', lat: 24.5, lon: 119.5, note: 'semiconductor supply lifeline', syms: 'EWT · SMH' },
+  { name: 'Strait of Gibraltar', lat: 35.95, lon: -5.6, note: 'Mediterranean gate', syms: null },
+  { name: 'Dover Strait', lat: 51.0, lon: 1.4, note: 'world’s busiest shipping lane', syms: null },
+];
+for (const c of CHOKEPOINTS) {
+  L.marker([c.lat, c.lon], {
+    icon: L.divIcon({ className: 'choke-icon', html: '◆', iconSize: [14, 14], iconAnchor: [7, 7] }),
+    keyboard: false,
+  }).bindPopup(el('div', {},
+    el('div', { style: 'font-weight:600' }, `◆ ${c.name}`),
+    el('div', { class: 'm' }, `shipping chokepoint · ${c.note}`),
+    c.syms ? el('div', { class: 'm' }, `watch on disruption: ${c.syms}`) : null,
+  )).addTo(map);
 }
 
 const markerLayer = L.layerGroup().addTo(map);
@@ -112,6 +161,14 @@ async function refreshShips() {
     if (!shipsOn) return;
     shipLayer.clearLayers();
     for (const s of d.ships) {
+      // heading vector for vessels under way
+      if (s.speed > 2 && Number.isFinite(s.course)) {
+        const len = 0.03 + s.speed * 0.006;
+        const rad = s.course * Math.PI / 180;
+        L.polyline([[s.lat, s.lon],
+          [s.lat + Math.cos(rad) * len, s.lon + Math.sin(rad) * len / Math.max(0.2, Math.cos(s.lat * Math.PI / 180))]],
+          { color: '#c98500', weight: 1, opacity: 0.5, interactive: false }).addTo(shipLayer);
+      }
       const m = L.circleMarker([s.lat, s.lon], {
         radius: 2.5, color: '#c98500', weight: 1, fillColor: '#c98500', fillOpacity: 0.75,
       });
@@ -157,6 +214,13 @@ function renderMarkers(events) {
     marker.bindPopup(popupContent(e));
     marker.addTo(markerLayer);
     markerById.set(e.id, marker);
+    // severe events get an animated pulse ring
+    if (e.severity >= 3) {
+      L.marker([e.lat, e.lon], {
+        icon: L.divIcon({ className: 'pulse-icon', html: `<span class="pulse-ring ${e.kind}"></span>`, iconSize: [36, 36], iconAnchor: [18, 18] }),
+        interactive: false, keyboard: false,
+      }).addTo(markerLayer);
+    }
   }
 }
 
