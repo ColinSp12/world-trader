@@ -16,7 +16,23 @@
     <a href="/trades" class="active">Trades</a>
   </nav>
   <span class="status" id="status"></span>
+  <button class="btn small" id="open-settings" title="API keys">⚙ Settings</button>
 </header>
+<dialog id="settings-dialog">
+  <h3>Settings — data API keys</h3>
+  <p class="dim-note">Keys are stored locally in <code>data.db</code> and apply immediately — no restart needed.</p>
+  <label class="set-field">aisstream.io key <span class="dim-note">(free — <a href="https://aisstream.io" target="_blank" rel="noopener">sign up</a>; unlocks live ships at global chokepoints)</span>
+    <div class="set-row"><input type="password" id="set-ais" placeholder="not set"><button class="btn small" id="clear-ais">Clear</button></div>
+  </label>
+  <label class="set-field">WorldMonitor API key <span class="dim-note">(optional, paid — unlocks extra worldmonitor.app feeds)</span>
+    <div class="set-row"><input type="password" id="set-wm" placeholder="not set"><button class="btn small" id="clear-wm">Clear</button></div>
+  </label>
+  <div class="set-actions">
+    <button class="btn" id="close-settings">Close</button>
+    <button class="btn primary" id="save-settings">Save</button>
+  </div>
+</dialog>
+<div id="toasts"></div>
 <div class="tickerbar">
   <div class="tradingview-widget-container">
     <div class="tradingview-widget-container__widget"></div>
@@ -69,6 +85,7 @@
         </div>
       </details>
     </div>
+    <div class="watchlist" id="watchlist"></div>
     <div id="tv-chart"></div>
   </section>
 
@@ -77,6 +94,11 @@
       <span class="tabbtns">
         <button id="tab-trades" class="active">Trades</button>
         <button id="tab-perf">Strategy performance</button>
+      </span>
+      <span class="tabbtns" id="blotter-filters">
+        <button data-f="all" class="active">All</button>
+        <button data-f="open">Open</button>
+        <button data-f="closed">Closed</button>
       </span>
       <a class="btn small" href="/api/trades.csv" style="margin-left:auto" download>Export CSV</a>
     </h2>

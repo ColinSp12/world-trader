@@ -9,7 +9,7 @@ const ROOT = import.meta.dirname;
 const PUBLIC_DIR = path.join(ROOT, 'public');
 const PORT = Number(process.env.PORT || 3555);
 const WM_BASE = 'https://api.worldmonitor.app';
-const WM_KEY = process.env.WM_API_KEY || '';
+let wmKey = process.env.WM_API_KEY || ''; // may be overridden from the settings table after db init
 const UA = 'world-trader/0.1 (local paper-trading experiment)';
 const EVENT_REFRESH_MS = 5 * 60 * 1000;
 const QUOTE_TTL_MS = 60 * 1000;
@@ -83,6 +83,8 @@ function getSetting(k, dflt) {
 function setSetting(k, v) {
   db.prepare('INSERT INTO settings (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v').run(k, String(v));
 }
+wmKey = getSetting('wm_api_key', wmKey);
+
 function logActivity(kind, message) {
   db.prepare('INSERT INTO activity (ts, kind, message) VALUES (?, ?, ?)').run(Date.now(), kind, message);
   db.prepare('DELETE FROM activity WHERE id NOT IN (SELECT id FROM activity ORDER BY id DESC LIMIT 500)').run();
@@ -120,7 +122,7 @@ async function fetchJson(url, extraHeaders = {}) {
 }
 
 function wmHeaders() {
-  return WM_KEY ? { 'X-API-Key': WM_KEY } : {};
+  return wmKey ? { 'X-API-Key': wmKey } : {};
 }
 
 // ---------------------------------------------------------------- events
@@ -716,7 +718,7 @@ async function getAreaFlights(lat, lon, radiusNm) {
 // live positions for the world's shipping chokepoints; without one we poll
 // Finland's open Digitraffic feed (Baltic Sea) so the layer works with zero
 // setup. Vessels are kept in memory keyed by MMSI and aged out after 20 min.
-const AISSTREAM_KEY = process.env.AISSTREAM_KEY || '';
+let aisKey = getSetting('aisstream_key', process.env.AISSTREAM_KEY || '');
 const ships = new Map();
 const SHIP_MAX_AGE_MS = 20 * 60 * 1000;
 const CHOKEPOINT_BOXES = [
@@ -762,16 +764,30 @@ async function refreshDigitraffic() {
   }
 }
 
+// Generation counter lets a settings change abandon the old connection (and
+// its pending reconnect timers) cleanly before starting a new one.
+let aisGen = 0;
+let aisWs = null;
+
+function stopAisStream() {
+  aisGen++;
+  if (aisWs) { try { aisWs.close(); } catch { /* already closed */ } aisWs = null; }
+}
+
 function startAisStream() {
+  const gen = ++aisGen;
   let backoff = 5000;
-  const retry = () => { setTimeout(connect, backoff); backoff = Math.min(backoff * 2, 120000); };
+  const retry = () => { if (gen !== aisGen) return; setTimeout(connect, backoff); backoff = Math.min(backoff * 2, 120000); };
   const connect = () => {
+    if (gen !== aisGen || !aisKey) return;
     let ws;
     try { ws = new WebSocket('wss://stream.aisstream.io/v0/stream'); } catch { retry(); return; }
+    aisWs = ws;
     ws.onopen = () => {
+      if (gen !== aisGen) { try { ws.close(); } catch { /* noop */ } return; }
       backoff = 5000;
       ws.send(JSON.stringify({
-        APIKey: AISSTREAM_KEY,
+        APIKey: aisKey,
         BoundingBoxes: CHOKEPOINT_BOXES,
         FilterMessageTypes: ['PositionReport'],
       }));
@@ -928,7 +944,7 @@ const server = http.createServer(async (req, res) => {
       }
     }
     if (p === '/api/ships' && req.method === 'GET') {
-      if (!AISSTREAM_KEY) {
+      if (!aisKey) {
         try { await refreshDigitraffic(); } catch (err) { /* serve what we have */ }
       }
       const now = Date.now();
@@ -936,12 +952,45 @@ const server = http.createServer(async (req, res) => {
       let list = [...ships.values()];
       if (list.length > 2000) list = list.sort((a, b) => (b.speed ?? 0) - (a.speed ?? 0)).slice(0, 2000);
       return json(res, 200, {
-        source: AISSTREAM_KEY
+        source: aisKey
           ? 'aisstream.io — live chokepoints (Hormuz, Suez, Malacca, Panama, Bosporus, Taiwan, Gibraltar, Dover)'
-          : 'Digitraffic open AIS — Baltic Sea demo. Set AISSTREAM_KEY (free at aisstream.io) for global chokepoint coverage.',
+          : 'Digitraffic open AIS — Baltic Sea demo. Add a free aisstream.io key in Settings for global chokepoint coverage.',
         count: list.length,
         ships: list,
       });
+    }
+    if (p === '/api/settings' && req.method === 'GET') {
+      const mask = (k) => (k ? `••••••••${k.slice(-4)}` : '');
+      return json(res, 200, { aisstream_key: mask(aisKey), wm_api_key: mask(wmKey) });
+    }
+    if (p === '/api/settings' && req.method === 'POST') {
+      const b = await readBody(req);
+      // Non-empty string sets a key; explicit null clears it; absent = unchanged.
+      if (typeof b.aisstream_key === 'string' && b.aisstream_key.trim()) {
+        aisKey = b.aisstream_key.trim();
+        setSetting('aisstream_key', aisKey);
+        ships.clear();
+        stopAisStream();
+        startAisStream();
+        logActivity('info', 'aisstream.io key saved — ships switching to global chokepoint coverage');
+      } else if (b.aisstream_key === null) {
+        aisKey = '';
+        setSetting('aisstream_key', '');
+        stopAisStream();
+        ships.clear();
+        logActivity('info', 'aisstream.io key removed — ships back to Baltic demo feed');
+      }
+      if (typeof b.wm_api_key === 'string' && b.wm_api_key.trim()) {
+        wmKey = b.wm_api_key.trim();
+        setSetting('wm_api_key', wmKey);
+        logActivity('info', 'WorldMonitor API key saved — keyed endpoints available on next refresh');
+      } else if (b.wm_api_key === null) {
+        wmKey = '';
+        setSetting('wm_api_key', '');
+        logActivity('info', 'WorldMonitor API key removed');
+      }
+      const mask = (k) => (k ? `••••••••${k.slice(-4)}` : '');
+      return json(res, 200, { ok: true, aisstream_key: mask(aisKey), wm_api_key: mask(wmKey) });
     }
     if (p === '/api/equity-history' && req.method === 'GET') {
       return json(res, 200, {
@@ -1017,7 +1066,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, exit_price: exit });
     }
     if (p === '/api/config' && req.method === 'GET') {
-      return json(res, 200, { wmKeyPresent: Boolean(WM_KEY), port: PORT, refreshMs: EVENT_REFRESH_MS, autopilot: autopilotOn });
+      return json(res, 200, { wmKeyPresent: Boolean(wmKey), port: PORT, refreshMs: EVENT_REFRESH_MS, autopilot: autopilotOn });
     }
     if (req.method === 'GET') return serveStatic(res, p);
     res.writeHead(405); res.end();
@@ -1034,5 +1083,5 @@ server.listen(PORT, () => {
     .catch((e) => console.error('[events] initial refresh failed:', e.message));
   setInterval(() => refreshEvents().catch((e) => console.error('[events] refresh failed:', e.message)), EVENT_REFRESH_MS);
   setInterval(() => autopilotTick(), 60 * 1000);
-  if (AISSTREAM_KEY) startAisStream();
+  if (aisKey) startAisStream();
 });

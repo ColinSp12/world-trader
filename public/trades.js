@@ -38,6 +38,19 @@ function loadChart(symbol) {
   });
   container.append(script);
   outer.append(container);
+  highlightWatchlist();
+}
+
+// ---- watchlist ----
+const WATCHLIST = ['SPY', 'QQQ', 'USO', 'XLE', 'GLD', 'UNG', 'VIXY', 'ITA', 'FRO', 'ZIM', 'EWT', 'BTCUSD'];
+{
+  const wl = document.getElementById('watchlist');
+  for (const sym of WATCHLIST) {
+    wl.append(el('button', { class: 'sym-btn', dataset: { sym }, onclick: () => loadChart(sym) }, sym));
+  }
+}
+function highlightWatchlist() {
+  document.querySelectorAll('#watchlist .sym-btn').forEach((b) => b.classList.toggle('active', b.dataset.sym === currentSymbol));
 }
 
 document.getElementById('load-symbol').addEventListener('click', () => {
@@ -51,6 +64,57 @@ document.getElementById('symbol-input').addEventListener('keydown', (e) => {
 function setStatus(msg) {
   document.getElementById('status').textContent = msg;
 }
+
+// ---- toasts ----
+function toast(msg, kind = '') {
+  const box = document.getElementById('toasts');
+  const t = el('div', { class: `toast ${kind}` }, msg);
+  box.append(t);
+  setTimeout(() => { t.classList.add('gone'); setTimeout(() => t.remove(), 400); }, 6500);
+  while (box.children.length > 4) box.firstChild.remove();
+}
+
+// ---- settings dialog ----
+const settingsDlg = document.getElementById('settings-dialog');
+document.getElementById('open-settings').addEventListener('click', async () => {
+  try {
+    const s = await api('/api/settings');
+    for (const [id, val] of [['set-ais', s.aisstream_key], ['set-wm', s.wm_api_key]]) {
+      const input = document.getElementById(id);
+      input.value = '';
+      input.placeholder = val || 'not set';
+    }
+  } catch { /* dialog still usable */ }
+  settingsDlg.showModal();
+});
+document.getElementById('close-settings').addEventListener('click', () => settingsDlg.close());
+document.getElementById('save-settings').addEventListener('click', async () => {
+  const body = {};
+  const ais = document.getElementById('set-ais').value.trim();
+  const wm = document.getElementById('set-wm').value.trim();
+  if (ais) body.aisstream_key = ais;
+  if (wm) body.wm_api_key = wm;
+  if (!Object.keys(body).length) { settingsDlg.close(); return; }
+  try {
+    await api('/api/settings', { method: 'POST', body });
+    toast(body.aisstream_key ? 'Saved — ships switching to global chokepoint coverage (check the Map)' : 'Settings saved');
+    settingsDlg.close();
+  } catch (err) {
+    toast(`Save failed: ${err.message}`);
+  }
+});
+document.getElementById('clear-ais').addEventListener('click', async (e) => {
+  e.preventDefault();
+  await api('/api/settings', { method: 'POST', body: { aisstream_key: null } });
+  document.getElementById('set-ais').placeholder = 'not set';
+  toast('aisstream key cleared — ships back to Baltic demo');
+});
+document.getElementById('clear-wm').addEventListener('click', async (e) => {
+  e.preventDefault();
+  await api('/api/settings', { method: 'POST', body: { wm_api_key: null } });
+  document.getElementById('set-wm').placeholder = 'not set';
+  toast('WorldMonitor key cleared');
+});
 
 // ---- suggested trades (plan cards) ----
 function planRow(s) {
@@ -223,20 +287,33 @@ function pnlCell(v) {
   return el('td', { class: Number.isFinite(v) ? (v >= 0 ? 'pnl-up' : 'pnl-down') : '' }, fmtPnl(v));
 }
 
+let blotterFilter = 'all';
+let lastTradesData = { trades: [] };
+document.querySelectorAll('#blotter-filters button').forEach((b) => b.addEventListener('click', () => {
+  blotterFilter = b.dataset.f;
+  document.querySelectorAll('#blotter-filters button').forEach((x) => x.classList.toggle('active', x === b));
+  showBlotterTab('trades');
+  renderBlotter(lastTradesData);
+}));
+
 function renderBlotter(data) {
-  const { trades } = data;
+  lastTradesData = data;
+  const trades = data.trades.filter((t) => blotterFilter === 'all' || t.status === blotterFilter);
   const box = document.getElementById('blotter');
   box.replaceChildren();
   if (!trades.length) {
-    box.append(el('div', { class: 'empty' }, 'No paper trades yet — the autopilot opens them automatically when actionable signals appear.'));
+    box.append(el('div', { class: 'empty' }, blotterFilter === 'all'
+      ? 'No paper trades yet — the autopilot opens them automatically when actionable signals appear.'
+      : `No ${blotterFilter} trades.`));
     return;
   }
   const table = el('table', {},
     el('thead', {}, el('tr', {},
-      ...['Symbol', '', 'Strategy', 'Side', 'Qty', 'Entry', 'Stop', 'Target', 'Mark/Exit', 'P&L', 'Opened', 'Exit', ''].map((h) => el('th', {}, h)))),
+      ...['Symbol', '', 'Strategy', 'Side', 'Qty', 'Entry', 'Stop', 'Target', 'Mark/Exit', 'P&L', 'P&L %', 'Opened', 'Exit', ''].map((h) => el('th', {}, h)))),
   );
   const tbody = el('tbody');
   for (const t of trades) {
+    const pnlPct = Number.isFinite(t.pnl) && t.entry_price * t.qty !== 0 ? (t.pnl / (t.entry_price * t.qty)) * 100 : null;
     tbody.append(el('tr', { class: t.status === 'closed' ? 'row-closed' : '' },
       el('td', { class: 'sym', style: 'cursor:pointer', onclick: () => loadChart(t.symbol) }, t.symbol),
       el('td', { style: 'text-align:left' }, t.auto ? el('span', { class: 'chip auto', title: 'opened by autopilot' }, 'auto') : null),
@@ -248,6 +325,7 @@ function renderBlotter(data) {
       el('td', { class: 'dim' }, fmtPrice(t.target_price)),
       el('td', {}, fmtPrice(t.mark)),
       pnlCell(t.pnl),
+      el('td', { class: Number.isFinite(pnlPct) ? (pnlPct >= 0 ? 'pnl-up' : 'pnl-down') : '' }, Number.isFinite(pnlPct) ? `${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}%` : '—'),
       el('td', { class: 'dim' }, timeAgo(t.opened_at)),
       el('td', { class: 'dim', style: 'text-align:left' }, t.status === 'closed' ? (t.exit_reason || 'closed') : (t.expires_at ? `by ${new Date(t.expires_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}` : 'open')),
       el('td', {}, t.status === 'open'
@@ -263,14 +341,76 @@ function renderBlotter(data) {
         : null),
     ));
   }
+  const totalPnl = trades.reduce((s, t) => s + (t.pnl ?? 0), 0);
+  tbody.append(el('tr', { class: 'blotter-total' },
+    el('td', { style: 'text-align:left' }, `Total (${trades.length})`),
+    ...Array.from({ length: 8 }, () => el('td')),
+    pnlCell(totalPnl),
+    el('td'), el('td'), el('td'), el('td'),
+  ));
   table.append(tbody);
   box.append(table);
+}
+
+// ---- equity chart (performance tab) ----
+function equityChart(points) {
+  if (!points || points.length < 2) {
+    return el('div', { class: 'empty' }, 'Equity curve appears after a few snapshots (recorded every 10 minutes).');
+  }
+  const w = 680, h = 170, padL = 58, padR = 12, padT = 12, padB = 22;
+  const xs = points.map((p) => p.ts);
+  const ys = points.map((p) => p.equity);
+  const minX = Math.min(...xs), maxX = Math.max(...xs);
+  let minY = Math.min(...ys), maxY = Math.max(...ys);
+  if (maxY - minY < 1) { maxY += 50; minY -= 50; }
+  const X = (t) => padL + ((t - minX) / (maxX - minX || 1)) * (w - padL - padR);
+  const Y = (v) => padT + ((maxY - v) / (maxY - minY)) * (h - padT - padB);
+  const NS = 'http://www.w3.org/2000/svg';
+  const mk = (tag, attrs, text) => {
+    const n = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, v);
+    if (text != null) n.textContent = text;
+    return n;
+  };
+  const svg = mk('svg', { viewBox: `0 0 ${w} ${h}`, class: 'equity-chart', role: 'img', 'aria-label': 'Account equity over time' });
+  for (const v of [minY, maxY]) {
+    svg.append(mk('line', { x1: padL, x2: w - padR, y1: Y(v), y2: Y(v), stroke: 'var(--grid)', 'stroke-width': 1 }));
+    svg.append(mk('text', { x: padL - 6, y: Y(v) + 4, 'text-anchor': 'end', fill: 'var(--muted)', 'font-size': 11 }, '$' + Math.round(v).toLocaleString()));
+  }
+  const linePts = points.map((p) => `${X(p.ts).toFixed(1)},${Y(p.equity).toFixed(1)}`).join(' ');
+  svg.append(mk('polygon', { points: `${X(minX).toFixed(1)},${Y(minY)} ${linePts} ${X(maxX).toFixed(1)},${Y(minY)}`, fill: 'var(--accent)', opacity: 0.08 }));
+  svg.append(mk('polyline', { points: linePts, fill: 'none', stroke: 'var(--accent)', 'stroke-width': 2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round' }));
+  const fmtT = (t) => new Date(t).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+  svg.append(mk('text', { x: padL, y: h - 6, fill: 'var(--muted)', 'font-size': 11 }, fmtT(minX)));
+  svg.append(mk('text', { x: w - padR, y: h - 6, 'text-anchor': 'end', fill: 'var(--muted)', 'font-size': 11 }, fmtT(maxX)));
+  // crosshair + tooltip
+  const cross = mk('line', { y1: padT, y2: h - padB, stroke: 'var(--muted)', 'stroke-width': 1, 'stroke-dasharray': '3,3', opacity: 0 });
+  const dot = mk('circle', { r: 3.5, fill: 'var(--accent)', opacity: 0 });
+  const tip = mk('text', { fill: 'var(--ink)', 'font-size': 11.5, 'text-anchor': 'middle', opacity: 0 });
+  svg.append(cross, dot, tip);
+  svg.addEventListener('mousemove', (ev) => {
+    const rect = svg.getBoundingClientRect();
+    const px = (ev.clientX - rect.left) * (w / rect.width);
+    let best = points[0];
+    for (const p of points) if (Math.abs(X(p.ts) - px) < Math.abs(X(best.ts) - px)) best = p;
+    cross.setAttribute('x1', X(best.ts)); cross.setAttribute('x2', X(best.ts)); cross.setAttribute('opacity', 0.5);
+    dot.setAttribute('cx', X(best.ts)); dot.setAttribute('cy', Y(best.equity)); dot.setAttribute('opacity', 1);
+    tip.setAttribute('x', Math.min(Math.max(X(best.ts), padL + 45), w - 55));
+    tip.setAttribute('y', Math.max(Y(best.equity) - 10, 15));
+    tip.setAttribute('opacity', 1);
+    tip.textContent = `$${Math.round(best.equity).toLocaleString()} · ${fmtT(best.ts)}`;
+  });
+  svg.addEventListener('mouseleave', () => {
+    for (const n of [cross, dot, tip]) n.setAttribute('opacity', 0);
+  });
+  return el('div', { class: 'equity-wrap' }, svg);
 }
 
 // ---- strategy performance ----
 function renderPerformance(rows) {
   const box = document.getElementById('perf');
   box.replaceChildren();
+  box.append(equityChart(equityHistory));
   if (!rows.length) {
     box.append(el('div', { class: 'empty' }, 'No autopilot trades yet — per-strategy results appear here as trades close.'));
     return;
@@ -328,6 +468,18 @@ function renderActivity(items) {
 }
 
 // ---- load loop ----
+let lastActivityId = null;
+function watchActivity(items) {
+  if (!items.length) return;
+  if (lastActivityId !== null) {
+    for (const a of items) {
+      if (a.id <= lastActivityId) break;
+      if (a.kind === 'open' || a.kind === 'close') toast(a.message, a.kind);
+    }
+  }
+  lastActivityId = items[0].id;
+}
+
 async function loadAll() {
   try {
     const [trades, activity, perf, eq] = await Promise.all([api('/api/trades'), api('/api/activity'), api('/api/performance'), api('/api/equity-history')]);
@@ -336,6 +488,7 @@ async function loadAll() {
     renderBlotter(trades);
     renderActivity(activity.activity);
     renderPerformance(perf.performance);
+    watchActivity(activity.activity);
   } catch (err) {
     setStatus(`Load failed: ${err.message}`);
   }
