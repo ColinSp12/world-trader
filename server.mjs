@@ -578,7 +578,10 @@ async function buildPlan(direction, rule, symbol, v = STRATEGY_VARIANTS.base, si
   const adr = Math.min(Math.max(q.adrPct ?? 0.02, 0.008), 0.06);
   const entry = q.price;
   const tune = ruleTuning.get(rule);
-  const stopDist = entry * clamp(v.stopAdr * adr * (tune?.stop_mult ?? 1), 0.01, 0.08);
+  // Sanity-clamp the base stop first, then apply the learned multiplier with
+  // wider bounds — inside one clamp, tuning saturates silently on high-ADR symbols.
+  const baseStop = clamp(v.stopAdr * adr, 0.01, 0.08);
+  const stopDist = entry * clamp(baseStop * (tune?.stop_mult ?? 1), 0.008, 0.15);
   const dir = direction === 'short' ? -1 : 1; // 'watch' plans as a long suggestion
   const stop = entry - dir * stopDist;
   const target = entry + dir * v.targetR * stopDist * (tune?.target_mult ?? 1);
@@ -845,10 +848,10 @@ const SCALP = {
   tickMs: 500,                            // decision cadence
   lookbackMs: 60 * 1000,                  // momentum window
   histLen: 160,                           // ~80s of 500ms snapshots
-  enterBps: SCALP_TEST ? 0.5 : 6,
+  enterBps: 6,
   targetBps: 12,
   stopBps: 9,
-  maxHoldMs: SCALP_TEST ? 45 * 1000 : 5 * 60 * 1000,
+  maxHoldMs: 5 * 60 * 1000,
   feeBps: 2,                              // per side, baked into fill prices
   notional: 5000,                         // per position, virtual dollars
 };
@@ -861,6 +864,11 @@ const scalpHist = new Map(); // symbol -> [{ts, price}]
 // directionally, retires the generation, and narrates the lesson.
 const EVOLVE_MIN_CLOSED = SCALP_TEST ? 6 : 30;
 const SCALP_TUNABLE = ['enterBps', 'targetBps', 'stopBps', 'maxHoldMs', 'lookbackMs'];
+// Generation seeds and mutations must derive from these production defaults or
+// from persisted params — never from the live SCALP object, which test mode
+// overrides at runtime and must not be allowed to poison the stored lineage.
+const SCALP_DEFAULTS = Object.freeze(Object.fromEntries(SCALP_TUNABLE.map((k) => [k, SCALP[k]])));
+let scalpBase = { ...SCALP_DEFAULTS }; // the active generation's persisted params
 let scalpGen = 1;
 
 function applyTestOverrides() {
@@ -870,12 +878,12 @@ function applyTestOverrides() {
 function loadScalpGen() {
   let row = db.prepare("SELECT * FROM strategy_params WHERE rule = ? AND status = 'active' ORDER BY gen DESC LIMIT 1").get(SCALP_RULE);
   if (!row) {
-    const params = Object.fromEntries(SCALP_TUNABLE.map((k) => [k, SCALP[k]]));
     db.prepare("INSERT INTO strategy_params (rule, gen, params, created_at, activated_at, status, note) VALUES (?, 1, ?, ?, ?, 'active', 'starting parameters')")
-      .run(SCALP_RULE, JSON.stringify(params), Date.now(), Date.now());
+      .run(SCALP_RULE, JSON.stringify(SCALP_DEFAULTS), Date.now(), Date.now());
     row = db.prepare("SELECT * FROM strategy_params WHERE rule = ? AND status = 'active'").get(SCALP_RULE);
   }
-  Object.assign(SCALP, JSON.parse(row.params));
+  scalpBase = { ...SCALP_DEFAULTS, ...JSON.parse(row.params) };
+  Object.assign(SCALP, scalpBase);
   applyTestOverrides();
   scalpGen = row.gen;
 }
@@ -891,12 +899,18 @@ function evolveScalper() {
       SUM(CASE WHEN exit_reason = 'scalp target' THEN 1 ELSE 0 END) AS targets
     FROM trades WHERE status = 'closed' AND strategy = ? AND variant = ?`).get(SCALP_RULE, `g${scalpGen}`);
   if (s.closed < EVOLVE_MIN_CLOSED) return;
+  // Entries stop once the sample is full (see scalperTick), so waiting for the
+  // stragglers to close means the generation retires on a complete record and
+  // the diagnosis below sees every one of its trades.
+  const openLeft = db.prepare("SELECT COUNT(*) AS n FROM trades WHERE status = 'open' AND strategy = ? AND variant = ?")
+    .get(SCALP_RULE, `g${scalpGen}`).n;
+  if (openLeft > 0) return;
 
   const winRate = s.wins / s.closed;
   db.prepare("UPDATE strategy_params SET trades = ?, pnl = ?, win_rate = ?, retired_at = ?, status = 'retired' WHERE rule = ? AND gen = ?")
     .run(s.closed, s.pnl, winRate, Date.now(), SCALP_RULE, scalpGen);
 
-  const p = Object.fromEntries(SCALP_TUNABLE.map((k) => [k, SCALP[k]]));
+  const p = Object.fromEntries(SCALP_TUNABLE.map((k) => [k, scalpBase[k]]));
   const reasons = [];
   const jitter = (v, f) => v * (1 + (Math.random() * 2 - 1) * f);
   if (s.pnl < 0) {
@@ -927,6 +941,7 @@ function evolveScalper() {
   const newGen = scalpGen + 1;
   db.prepare("INSERT INTO strategy_params (rule, gen, params, created_at, activated_at, status, note) VALUES (?, ?, ?, ?, ?, 'active', ?)")
     .run(SCALP_RULE, newGen, JSON.stringify(p), Date.now(), Date.now(), reasons.join('; '));
+  scalpBase = p;
   Object.assign(SCALP, p);
   applyTestOverrides();
   scalpGen = newGen;
@@ -947,15 +962,26 @@ function evolveSlowRules() {
     if (s.closed < 8) continue;
     const t = ruleTuning.get(rule) || { stop_mult: 1, target_mult: 1, horizon_mult: 1 };
     const reasons = [];
+    // Each branch reports honestly when its multiplier is pinned at a bound —
+    // the log must never claim an adaptation that changed nothing.
     if (s.pnl < 0 && s.stops / s.closed >= 0.5) {
-      t.stop_mult = clamp(t.stop_mult * 1.2, 0.5, 2.5);
-      reasons.push(`${s.stops}/${s.closed} recent trades stopped out at a net loss — widening stops`);
+      const next = clamp(t.stop_mult * 1.2, 0.5, 2.5);
+      reasons.push(next !== t.stop_mult
+        ? `${s.stops}/${s.closed} recent trades stopped out at a net loss — widening stops`
+        : `${s.stops}/${s.closed} stopped out at a net loss but stops are already at their widest — holding steady`);
+      t.stop_mult = next;
     } else if (s.pnl < 0 && s.timeouts / s.closed >= 0.5) {
-      t.target_mult = clamp(t.target_mult * 0.85, 0.4, 2.5);
-      reasons.push(`${s.timeouts}/${s.closed} timed out before reaching the target — bringing targets closer`);
+      const next = clamp(t.target_mult * 0.85, 0.4, 2.5);
+      reasons.push(next !== t.target_mult
+        ? `${s.timeouts}/${s.closed} timed out before reaching the target — bringing targets closer`
+        : `${s.timeouts}/${s.closed} timed out but targets are already at their closest — holding steady`);
+      t.target_mult = next;
     } else if (s.pnl > 0 && s.targets / s.closed >= 0.5) {
-      t.target_mult = clamp(t.target_mult * 1.15, 0.4, 2.5);
-      reasons.push(`targets hitting ${s.targets}/${s.closed} — stretching for more`);
+      const next = clamp(t.target_mult * 1.15, 0.4, 2.5);
+      reasons.push(next !== t.target_mult
+        ? `targets hitting ${s.targets}/${s.closed} — stretching for more`
+        : `targets hitting ${s.targets}/${s.closed} with targets already stretched to the cap — holding steady`);
+      t.target_mult = next;
     } else {
       continue;
     }
@@ -1034,6 +1060,11 @@ async function scalperTick() {
     }
 
     {
+      // Once the active generation has its full sample, stop opening new
+      // positions — stragglers drain and evolveScalper retires it on a
+      // complete record instead of freezing stats mid-flight.
+      const genFull = db.prepare("SELECT COUNT(*) AS n FROM trades WHERE status = 'closed' AND strategy = ? AND variant = ?")
+        .get(SCALP_RULE, `g${scalpGen}`).n >= EVOLVE_MIN_CLOSED;
       for (const sym of Object.keys(SCALP_PAIRS)) {
         const live = livePrices.get(sym);
         if (!live || now - live.ts > 10000) continue;
@@ -1059,7 +1090,7 @@ async function scalperTick() {
           continue;
         }
 
-        if (!autopilotOn || !scalperOn) continue; // entries only while enabled
+        if (!autopilotOn || !scalperOn || genFull) continue; // entries only while enabled
 
         // momentum vs the snapshot ~lookbackMs ago; the baseline must itself
         // be fresh — after a sleep/outage gap, price drift would fake momentum.

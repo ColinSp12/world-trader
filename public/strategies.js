@@ -250,13 +250,13 @@ function heatmap(days) {
   const byDay = new Map(days.map((d) => [d.day, d]));
   const maxAbs = Math.max(1, ...days.map((d) => Math.abs(d.pnl)));
   const grid = el('div', { class: 'heatmap' });
-  const today = new Date();
+  // Step in UTC epoch days — the server buckets /api/daily-pnl by UTC day, and
+  // local-time stepping duplicates/skips a day when the window spans a DST shift.
+  const todayUtc = Math.floor(Date.now() / 86400000);
   for (let w = 11; w >= 0; w--) {
     const col = el('div', { class: 'hm-col' });
     for (let d = 6; d >= 0; d--) {
-      const date = new Date(today);
-      date.setDate(date.getDate() - (w * 7 + d));
-      const key = date.toISOString().slice(0, 10);
+      const key = new Date((todayUtc - (w * 7 + d)) * 86400000).toISOString().slice(0, 10);
       const rec = byDay.get(key);
       const cell = el('span', {
         class: 'hm-cell',
