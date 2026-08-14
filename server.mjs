@@ -488,8 +488,11 @@ function realizedTotal() {
 }
 
 function closeTrade(t, exitPrice, reason) {
-  db.prepare("UPDATE trades SET status = 'closed', closed_at = ?, exit_price = ?, exit_reason = ? WHERE id = ?")
+  // Guarded + idempotent: concurrent closers (manual close vs the 500ms
+  // scalper tick vs the manage loop) race across awaits — only one wins.
+  const info = db.prepare("UPDATE trades SET status = 'closed', closed_at = ?, exit_price = ?, exit_reason = ? WHERE id = ? AND status = 'open'")
     .run(Date.now(), exitPrice, reason, t.id);
+  if (Number(info.changes) === 0) return null; // already closed elsewhere
   const pnl = tradePnl({ ...t, status: 'closed', exit_price: exitPrice });
   // Scalper fills log as 'scalp' so the toast layer (open/close only) stays quiet.
   logActivity(t.strategy === SCALP_RULE ? 'scalp' : 'close',
@@ -886,7 +889,7 @@ async function scalperTick() {
       } catch { /* next fallback window retries */ }
     }
 
-    if (autopilotOn && scalperOn) {
+    {
       for (const sym of Object.keys(SCALP_PAIRS)) {
         const live = livePrices.get(sym);
         if (!live || now - live.ts > 10000) continue;
@@ -894,8 +897,11 @@ async function scalperTick() {
         const hist = scalpHist.get(sym) || [];
         hist.push({ ts: now, price: px });
         while (hist.length > SCALP.histLen) hist.shift();
+        while (hist.length && now - hist[0].ts > SCALP.lookbackMs * 2) hist.shift(); // drop pre-gap snapshots
         scalpHist.set(sym, hist);
 
+        // Manage open positions on EVERY tick — a paused scalper must still
+        // honor its stops/targets/time-outs, never abandon a live position.
         const open = db.prepare("SELECT * FROM trades WHERE status = 'open' AND symbol = ? AND strategy = ?").get(sym, SCALP_RULE);
         if (open) {
           const dir = open.side === 'long' ? 1 : -1;
@@ -909,11 +915,14 @@ async function scalperTick() {
           continue;
         }
 
-        // momentum vs the snapshot ~lookbackMs ago
+        if (!autopilotOn || !scalperOn) continue; // entries only while enabled
+
+        // momentum vs the snapshot ~lookbackMs ago; the baseline must itself
+        // be fresh — after a sleep/outage gap, price drift would fake momentum.
         const cutoff = now - SCALP.lookbackMs;
         let back = null;
         for (const h of hist) { if (h.ts <= cutoff) back = h; else break; }
-        if (!back) continue;
+        if (!back || now - back.ts > SCALP.lookbackMs * 1.5) continue;
         const momBps = ((px - back.price) / back.price) * 10000;
         if (Math.abs(momBps) < SCALP.enterBps) continue;
         const side = momBps > 0 ? 'long' : 'short';
@@ -1243,6 +1252,10 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { quotes: await getQuotes(symbols) });
     }
     if (p === '/api/trades' && req.method === 'GET') {
+      // Summary spans ALL trades; the returned list is capped — scalper volume
+      // would otherwise grow this payload without bound (CSV has everything).
+      const limitRaw = Number(url.searchParams.get('limit'));
+      const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 5000) : 400;
       const trades = db.prepare('SELECT * FROM trades ORDER BY opened_at DESC').all();
       const openSymbols = [...new Set(trades.filter((t) => t.status === 'open').map((t) => t.symbol))];
       const quotes = openSymbols.length ? await getQuotes(openSymbols) : {};
@@ -1258,7 +1271,8 @@ const server = http.createServer(async (req, res) => {
       const wins = closed.filter((t) => (t.pnl ?? 0) > 0).length;
       const autoTrades = enriched.filter((t) => t.auto);
       return json(res, 200, {
-        trades: enriched,
+        trades: enriched.slice(0, limit),
+        total: enriched.length,
         summary: {
           openCount: open.length, closedCount: closed.length,
           realized, unrealized,

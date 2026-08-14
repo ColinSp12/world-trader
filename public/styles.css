@@ -139,17 +139,17 @@ aside.side {
 main.trades {
   flex: 1; min-height: 0;
   display: grid;
-  grid-template-columns: 400px minmax(0, 1fr) 330px;
+  grid-template-columns: 380px minmax(0, 1fr) 300px;
   /* every row bounded so panels scroll internally instead of growing the page */
   grid-template-rows: auto minmax(320px, 1.15fr) minmax(180px, 0.85fr);
   gap: 12px; padding: 12px;
 }
 #signals-panel { grid-column: 1; grid-row: 2 / 4; }
-#chart-panel { grid-column: 2 / 4; grid-row: 2; min-height: 320px; }
+#chart-panel { grid-column: 2; grid-row: 2; min-height: 320px; }
 #blotter-panel { grid-column: 2; grid-row: 3; }
-#activity-panel { grid-column: 3; grid-row: 3; }
+#tape-panel { grid-column: 3; grid-row: 1 / 4; }
 
-.tiles { grid-column: 1 / -1; display: flex; gap: 12px; flex-wrap: wrap; }
+.tiles { grid-column: 1 / 3; display: flex; gap: 12px; flex-wrap: wrap; }
 .tile {
   flex: 1; min-width: 150px;
   background: var(--surface); border: 1px solid var(--hairline); border-radius: 8px;

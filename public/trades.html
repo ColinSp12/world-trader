@@ -100,6 +100,7 @@
       <span class="tabbtns">
         <button id="tab-trades" class="active">Trades</button>
         <button id="tab-perf">Strategy performance</button>
+        <button id="tab-engine">Engine</button>
       </span>
       <span class="tabbtns" id="blotter-filters">
         <button data-f="all" class="active">All</button>
@@ -110,17 +111,12 @@
     </h2>
     <div class="scroll" id="blotter"></div>
     <div class="scroll" id="perf" hidden></div>
+    <div class="scroll" id="activity" hidden></div>
   </section>
 
-  <section class="panel" id="activity-panel">
-    <h2>Log
-      <span class="tabbtns">
-        <button id="tab-log" class="active">Trades</button>
-        <button id="tab-engine">Engine</button>
-      </span>
-    </h2>
+  <section class="panel" id="tape-panel">
+    <h2>Live fills</h2>
     <div class="scroll" id="tradelog"></div>
-    <div class="scroll" id="activity" hidden></div>
   </section>
 </main>
 <script type="module" src="/trades.js"></script>

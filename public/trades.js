@@ -451,23 +451,16 @@ function renderPerformance(rows) {
 
 document.getElementById('tab-trades').addEventListener('click', () => showBlotterTab('trades'));
 document.getElementById('tab-perf').addEventListener('click', () => showBlotterTab('perf'));
+document.getElementById('tab-engine').addEventListener('click', () => showBlotterTab('engine'));
 function showBlotterTab(which) {
-  document.getElementById('blotter').hidden = which !== 'trades';
-  document.getElementById('perf').hidden = which !== 'perf';
-  document.getElementById('tab-trades').classList.toggle('active', which === 'trades');
-  document.getElementById('tab-perf').classList.toggle('active', which === 'perf');
+  const panes = { trades: 'blotter', perf: 'perf', engine: 'activity' };
+  for (const [tab, pane] of Object.entries(panes)) {
+    document.getElementById(pane).hidden = tab !== which;
+    document.getElementById(`tab-${tab}`).classList.toggle('active', tab === which);
+  }
 }
 
-// ---- trade log (broker-style: green buys, red sells, signed P&L) ----
-document.getElementById('tab-log').addEventListener('click', () => showLogTab('log'));
-document.getElementById('tab-engine').addEventListener('click', () => showLogTab('engine'));
-function showLogTab(which) {
-  document.getElementById('tradelog').hidden = which !== 'log';
-  document.getElementById('activity').hidden = which !== 'engine';
-  document.getElementById('tab-log').classList.toggle('active', which === 'log');
-  document.getElementById('tab-engine').classList.toggle('active', which === 'engine');
-}
-
+// ---- trade log tape (broker-style: green buys, red sells, signed P&L) ----
 function renderTradeLog(trades) {
   renderTradeLogList(document.getElementById('tradelog'), trades, 250);
 }
