@@ -7,6 +7,8 @@ const RULE_TITLES = {
   'oil-producer-unrest': 'Oil Producer Unrest', 'chokepoint-disruption': 'Chokepoint Unrest',
   'chokepoint-transit-drop': 'Transit Drop', 'quake-country-etf': 'Earthquake Fade',
   'hurricane-energy': 'Hurricane Energy', 'global-risk-off': 'Global Risk-Off', 'headline-risk': 'Headline Risk',
+  'orb-15min': '15-Min Opening Range Breakout', 'gap-fade': 'Overnight Gap Fade',
+  'vwap-revert': 'VWAP Reversion', 'fx-session': 'London FX Breakout',
 };
 
 function setStatus(msg, isErr = false) {

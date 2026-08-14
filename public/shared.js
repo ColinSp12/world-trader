@@ -59,6 +59,7 @@ export function fmtPnl(v) {
 
 export function fmtPrice(v) {
   if (!Number.isFinite(v)) return '—';
+  if (v < 10) return v.toFixed(4); // FX rates and sub-$10 coins need pips
   return v >= 1000 ? v.toFixed(0) : v.toFixed(2);
 }
 
@@ -71,6 +72,7 @@ export const RULE_FAMILY = {
   'oil-producer-unrest': 'event', 'chokepoint-disruption': 'event', 'chokepoint-transit-drop': 'event',
   'quake-country-etf': 'event', 'hurricane-energy': 'event', 'global-risk-off': 'event', 'headline-risk': 'event',
   'ma-cross': 'tech', 'rsi-reversal': 'tech', 'breakout-20': 'tech',
+  'orb-15min': 'day', 'gap-fade': 'day', 'vwap-revert': 'day', 'fx-session': 'day',
   'momo-scalper': 'hyper',
 };
 export function famDot(strategy) {

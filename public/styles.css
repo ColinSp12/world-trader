@@ -649,3 +649,7 @@ main.backtest {
 /* ---- blotter horizontal scroll on narrow widths ---- */
 #blotter { overflow-x: auto; }
 #blotter table { min-width: 760px; }
+
+/* ---- day-trading strategy family (gold) ---- */
+.fam-dot.fam-day { background: #d0a215; }
+.fam-border-day { border-left: 3px solid #d0a215; }

@@ -208,6 +208,7 @@ function etNow(ts = Date.now()) {
   const parts = Object.fromEntries(ET_FMT.formatToParts(new Date(ts)).map((p) => [p.type, p.value]));
   const val = {
     day: `${parts.year}-${parts.month}-${parts.day}`,
+    dow: parts.weekday,
     weekend: parts.weekday === 'Sat' || parts.weekday === 'Sun',
     minutes: Number(parts.hour) % 24 * 60 + Number(parts.minute),
   };
@@ -221,8 +222,17 @@ function usMarketOpen(ts = Date.now()) {
   return p.minutes >= 9 * 60 + 30 && p.minutes < close;
 }
 const isCrypto = (sym) => sym.endsWith('-USD');
-// Crypto trades around the clock; everything else only during the US session.
-const marketOpenFor = (sym, ts) => isCrypto(sym) || usMarketOpen(ts);
+const isFx = (sym) => sym.endsWith('=X');
+// FX runs continuously from Sunday 17:00 ET to Friday 17:00 ET.
+function fxMarketOpen(ts = Date.now()) {
+  const p = etNow(ts);
+  if (p.dow === 'Sat') return false;
+  if (p.dow === 'Fri' && p.minutes >= 17 * 60) return false;
+  if (p.dow === 'Sun' && p.minutes < 17 * 60) return false;
+  return true;
+}
+// Crypto trades around the clock, FX nearly so; equities only in the US session.
+const marketOpenFor = (sym, ts) => isCrypto(sym) || (isFx(sym) ? fxMarketOpen(ts) : usMarketOpen(ts));
 
 // ---------------------------------------------------------------- friction
 // Honest fills for the ETF book: half the typical bid/ask spread plus a
@@ -235,6 +245,8 @@ const SPREAD_BPS = {
   EWI: 5, EWP: 5, TUR: 8, EIS: 6, KSA: 6, EZA: 5, ECH: 6, EIDO: 6, EPHE: 8,
   VNM: 6, EPOL: 6, NGE: 15, ARGT: 5, EWA: 3, EWC: 3, GREK: 8, EGPT: 15,
   PAK: 15, THD: 6, EWM: 6, EPU: 10, GXG: 12, URA: 4, LMT: 2, PANW: 2, BUG: 6, SMH: 2,
+  AAPL: 1, NVDA: 2, TSLA: 3,
+  'EURUSD=X': 1, 'GBPUSD=X': 1.5, 'AUDUSD=X': 1.5, // retail FX majors: ~1 pip
 };
 const SLIPPAGE_BPS = 2;
 const frictionBps = (sym) => (SPREAD_BPS[sym] ?? 12) / 2 + SLIPPAGE_BPS;
@@ -495,11 +507,17 @@ function dayKey(ts) {
 }
 
 function makeSignal(sig) {
+  // sig.plan lets a rule set its OWN levels at creation (day-trade rules use
+  // range/VWAP-derived stops, not ADR ones); a preset plan_entry also stops
+  // the autopilot's generic planner from overwriting it.
+  const p = sig.plan || {};
   const stmt = db.prepare(`INSERT OR IGNORE INTO signals
-    (id, created_at, rule, headline, thesis, direction, symbols, tv_symbol, confidence, event_json)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    (id, created_at, rule, headline, thesis, direction, symbols, tv_symbol, confidence, event_json,
+     plan_entry, plan_stop, plan_target, plan_qty, horizon_days)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
   return stmt.run(sig.id, Date.now(), sig.rule, sig.headline, sig.thesis, sig.direction,
-    JSON.stringify(sig.symbols), sig.tvSymbol, sig.confidence, JSON.stringify(sig.event || null));
+    JSON.stringify(sig.symbols), sig.tvSymbol, sig.confidence, JSON.stringify(sig.event || null),
+    p.entry ?? null, p.stop ?? null, p.target ?? null, p.qty ?? null, p.horizonDays ?? null);
 }
 
 function deriveSignals(events) {
@@ -686,6 +704,10 @@ const STRATEGY_META = {
   'ma-cross': { family: 'tech', title: 'EMA 5/20 Momentum', desc: 'The 5-day EMA crossing the 20-day EMA on a liquid ETF → trade in the direction of the cross. Classic short-term trend following: ride fresh momentum shifts for a day or two.' },
   'rsi-reversal': { family: 'tech', title: 'RSI(2) Mean Reversion', desc: '2-period RSI under 10 → long the snap-back; over 90 → short. Connors-style: extreme short-term readings on index/sector ETFs tend to revert within 1–2 sessions.' },
   'breakout-20': { family: 'tech', title: '20-Day Breakout', desc: 'Close beyond the prior 20-day high or low (Donchian channel) → trade the direction of the break. Range expansion tends to carry short-term follow-through.' },
+  'orb-15min': { family: 'day', title: '15-Min Opening Range Breakout', desc: 'Records the high and low of the first 15 minutes after the US open, then trades the first clean break of that range — long above the high, short below the low — with the stop at the range midpoint and the target at 1.5× the range beyond the break. Always flat before the close. The classic day-trading setup, run on SPY, QQQ, IWM, AAPL, NVDA, TSLA.' },
+  'gap-fade': { family: 'day', title: 'Overnight Gap Fade', desc: 'When a symbol opens 0.4–3% away from yesterday’s close and is still stretched mid-morning, fade the gap back toward the prior close (short a gap-up, long a gap-down). Target = yesterday’s close (the fill), stop at 60% of the gap beyond entry, flat by the close. Bets on the well-documented tendency of moderate gaps to fill.' },
+  'vwap-revert': { family: 'day', title: 'VWAP Reversion', desc: 'Volume-weighted average price is the institutional anchor of the session. When price stretches far from VWAP (threshold scaled to each symbol’s volatility), fade back toward it — target at VWAP, stop at 60% of the stretch beyond entry, flat by the close.' },
+  'fx-session': { family: 'day', title: 'London FX Breakout', desc: 'The non-US-market account: trades EUR/USD, GBP/USD, and AUD/USD during the London session. Records the first hour of London trading (3–4am ET), then trades the break of that range with the stop at the midpoint and a 1.5× range target, flat before the New York lunch. Unleveraged, so positions are small — the point is whether the edge exists at all.' },
   'momo-scalper': { family: 'hyper', title: 'Momentum Scalper', desc: '24/7 crypto scalper on real-time Binance prices (BTC, ETH, SOL, XRP, DOGE, LTC): enters on short-burst momentum, exits at bps-scale targets/stops or a minutes-scale time-out, $5k notional per position. Costs are modeled honestly — ~10 bps per-side taker fee and spread-crossing fills baked into every trade — and the parameters evolve in generations, so the open question the account answers is whether any momentum edge survives real costs.' },
 };
 
@@ -707,7 +729,37 @@ const RULE_HORIZON_DAYS = {
   'hurricane-energy': 1.5, 'global-risk-off': 2, 'headline-risk': 1,
   'chokepoint-transit-drop': 2,
   'ma-cross': 2, 'rsi-reversal': 1, 'breakout-20': 2,
+  'orb-15min': 0.3, 'gap-fade': 0.3, 'vwap-revert': 0.3, 'fx-session': 0.3,
 };
+
+// Intraday rules: they carry their own levels (set at signal creation), enter
+// only while fresh, and are always flat before their session ends.
+const DAY_RULES = new Set(['orb-15min', 'gap-fade', 'vwap-revert', 'fx-session']);
+
+async function buildDayPlan(s, sizeFactor = 1) {
+  const q = await getQuote(s.tv_symbol);
+  if (q.stale) throw new Error(`quote for ${s.tv_symbol} is stale — not trading on it`);
+  const dir = s.direction === 'short' ? -1 : 1;
+  const entry = q.price;
+  const stop = s.plan_stop;
+  const target = s.plan_target;
+  if (!Number.isFinite(stop) || !Number.isFinite(target)) throw new Error('day signal missing its levels');
+  if ((entry - stop) * dir <= 0) throw new Error('price already through the stop — setup invalidated');
+  if ((target - entry) * dir <= 0) throw new Error('price already at the target — move missed');
+  const stopDist = Math.abs(entry - stop);
+  const equity = sizingEquity();
+  let riskFrac = RISK_PER_TRADE;
+  if (await vixHalvesRisk()) riskFrac /= 2;
+  let qty = Math.floor((equity * riskFrac * sizeFactor) / stopDist);
+  if (qty * entry > equity * MAX_POSITION_FRACTION) qty = Math.floor((equity * MAX_POSITION_FRACTION) / entry);
+  if (qty < 1) {
+    if (stopDist <= equity * riskFrac * Math.max(sizeFactor, 0.1) * 2) qty = 1;
+    else throw new Error(`sizing: one share of ${s.tv_symbol} exceeds the risk budget`);
+  }
+  // Flat before the session ends: US day trades by 15:55 ET, FX by 11:45 ET.
+  const sessEndMin = s.rule === 'fx-session' ? 11 * 60 + 45 : 15 * 60 + 55;
+  return { entry, stop, target, qty, horizon: 0, expiresAt: etDayStart(Date.now()) + sessEndMin * 60000 };
+}
 
 // Exit-style variants — each auto trade is tagged (strategy rule × variant) so
 // performance can be compared per combination and sizing adapted over time.
@@ -892,6 +944,9 @@ async function autopilotTick() {
         // Saturday would otherwise book an untradeable weekend gap. The signal
         // stays queued and executes at the next open if still fresh.
         if (!marketOpenFor(s.tv_symbol, now)) continue;
+        // Intraday setups go stale in minutes, not hours — a 9:50 breakout
+        // means nothing at 11:30.
+        if (DAY_RULES.has(s.rule) && now - s.created_at > 30 * 60 * 1000) continue;
         const openCount = db.prepare("SELECT COUNT(*) AS c FROM trades WHERE status = 'open' AND COALESCE(strategy, '') != ?").get(SCALP_RULE).c;
         if (openCount >= MAX_OPEN_POSITIONS) { logActivity('skip', `Max ${MAX_OPEN_POSITIONS} open positions — ${s.tv_symbol} stays queued`); break; }
         // One position per symbol PER STRATEGY: each strategy runs its own
@@ -915,16 +970,27 @@ async function autopilotTick() {
           }
         }
         try {
-          const pick = pickVariant(s.rule);
-          if (!pick) { // defensive — base always has factor > 0
-            db.prepare("UPDATE signals SET status = 'skipped' WHERE id = ?").run(s.id);
-            logActivity('skip', `All ${s.rule} variants paused — ${s.tv_symbol} not traded`);
-            continue;
+          // Day rules carry their own range/VWAP-derived levels and always tag
+          // variant 'base' — ADR exit-style variants don't apply intraday.
+          let variant, adj;
+          if (DAY_RULES.has(s.rule)) {
+            variant = 'base';
+            adj = sizeAdjustment(s.rule, 'base');
+          } else {
+            const pick = pickVariant(s.rule);
+            if (!pick) { // defensive — base always has factor > 0
+              db.prepare("UPDATE signals SET status = 'skipped' WHERE id = ?").run(s.id);
+              logActivity('skip', `All ${s.rule} variants paused — ${s.tv_symbol} not traded`);
+              continue;
+            }
+            variant = pick.name;
+            adj = pick.adj;
           }
-          const { name: variant, adj } = pick;
           if (adj.why) logActivity('info', adj.why);
           const confFactor = CONFIDENCE_SIZE[s.confidence] ?? 1;
-          const plan = await buildPlan(s.direction, s.rule, s.tv_symbol, STRATEGY_VARIANTS[variant], adj.factor * confFactor);
+          const plan = DAY_RULES.has(s.rule)
+            ? await buildDayPlan(s, adj.factor * confFactor)
+            : await buildPlan(s.direction, s.rule, s.tv_symbol, STRATEGY_VARIANTS[variant], adj.factor * confFactor);
           // Gross-exposure cap: total deployed notional stays within 1× equity.
           const grossOpen = db.prepare("SELECT COALESCE(SUM(entry_price * qty), 0) AS n FROM trades WHERE status = 'open' AND COALESCE(strategy,'') != ?").get(SCALP_RULE).n;
           if (grossOpen + plan.entry * plan.qty > sizingEquity() * GROSS_EXPOSURE_CAP) {
@@ -941,7 +1007,7 @@ async function autopilotTick() {
           db.prepare(`INSERT INTO trades (opened_at, symbol, side, qty, entry_price, stop_price, target_price, expires_at, auto, signal_id, thesis, strategy, variant, fees)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)`)
             .run(now, s.tv_symbol, s.direction, plan.qty, fill, plan.stop, plan.target,
-              now + plan.horizon * 24 * 3600 * 1000, s.id, s.headline, s.rule, variant, entryFriction);
+              plan.expiresAt ?? (now + plan.horizon * 24 * 3600 * 1000), s.id, s.headline, s.rule, variant, entryFriction);
           db.prepare("UPDATE signals SET status = 'taken' WHERE id = ?").run(s.id);
           logActivity('open', `AUTO opened ${s.direction} ${plan.qty} ${s.tv_symbol} @ ${fill.toFixed(2)} · stop ${plan.stop.toFixed(2)} · target ${plan.target.toFixed(2)} · ${s.rule}/${variant} · exit by ${new Date(now + plan.horizon * 86400000).toISOString().slice(0, 10)} — ${s.headline}`);
           broadcast('fill', { action: 'open', symbol: s.tv_symbol });
@@ -1094,6 +1160,177 @@ async function scanTechnicals() {
     }
   }
   console.log('[tech] scan complete');
+}
+
+// ---------------------------------------------------------------- day trading strategies
+// Intraday rules on delayed Yahoo 5-minute bars (fine for paper trading):
+// opening-range breakout, overnight-gap fade, VWAP reversion on liquid US
+// names, plus a London-session FX breakout so at least one account trades a
+// market that is not the US equity session. All flat before their session ends.
+const DAY_UNIVERSE = ['SPY', 'QQQ', 'IWM', 'AAPL', 'NVDA', 'TSLA'];
+const FX_PAIRS = ['EURUSD=X', 'GBPUSD=X', 'AUDUSD=X'];
+const intradayCache = new Map(); // symbol -> { bars, at }
+
+async function getIntradayBars(symbol) {
+  const hit = intradayCache.get(symbol);
+  if (hit && Date.now() - hit.at < 3 * 60 * 1000) return hit.bars;
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=5m&range=1d`;
+  const data = await fetchJson(url, { Accept: 'application/json' });
+  const r = data?.chart?.result?.[0];
+  const q = r?.indicators?.quote?.[0];
+  if (!q?.close) throw new Error('no intraday bars');
+  const bars = [];
+  for (let i = 0; i < q.close.length; i++) {
+    if ([q.open[i], q.high[i], q.low[i], q.close[i]].every(Number.isFinite)) {
+      bars.push({ ts: r.timestamp[i] * 1000, o: q.open[i], h: q.high[i], l: q.low[i], c: q.close[i], v: q.volume?.[i] ?? 0 });
+    }
+  }
+  intradayCache.set(symbol, { bars, at: Date.now() });
+  return bars;
+}
+
+const dayId = (rule, sym, now) => `${rule}:${sym}:${etNow(now).day}`;
+const sigExists = (id) => Boolean(db.prepare('SELECT 1 FROM signals WHERE id = ?').get(id));
+
+async function scanDayTrades() {
+  const now = Date.now();
+  // Unentered intraday setups expire fast instead of lingering in the queue.
+  db.prepare(`UPDATE signals SET status = 'expired' WHERE status = 'new' AND created_at < ?
+    AND rule IN ('orb-15min', 'gap-fade', 'vwap-revert', 'fx-session')`).run(now - 45 * 60 * 1000);
+  const m = etNow(now).minutes;
+  const dayStart = etDayStart(now);
+
+  if (usMarketOpen(now)) {
+    for (const sym of DAY_UNIVERSE) {
+      try {
+        const needOrb = m >= 9 * 60 + 47 && m <= 11 * 60 + 30 && !sigExists(dayId('orb-15min', sym, now));
+        const needGap = m >= 9 * 60 + 35 && m <= 10 * 60 + 15 && !sigExists(dayId('gap-fade', sym, now));
+        const needVwap = m >= 10 * 60 && m <= 15 * 60 && !sigExists(dayId('vwap-revert', sym, now));
+        if (!needOrb && !needGap && !needVwap) continue;
+        const bars = (await getIntradayBars(sym)).filter((b) => b.ts >= dayStart);
+        if (bars.length < 4) continue;
+        const last = bars[bars.length - 1];
+        const prevC = bars[bars.length - 2].c;
+        const q = await getQuote(sym);
+        const roughQty = (stop) => Math.max(1, Math.floor((sizingEquity() * RISK_PER_TRADE) / Math.max(Math.abs(last.c - stop), last.c * 0.001)));
+
+        // --- 15-minute opening range breakout ---
+        if (needOrb) {
+          const or = bars.filter((b) => b.ts >= dayStart + (9 * 60 + 30) * 60000 && b.ts < dayStart + (9 * 60 + 45) * 60000);
+          if (or.length >= 2) {
+            const orh = Math.max(...or.map((b) => b.h));
+            const orl = Math.min(...or.map((b) => b.l));
+            const range = orh - orl;
+            let dirName = null;
+            if (range > 0 && range / last.c < 0.04) {
+              if (last.c > orh && prevC <= orh) dirName = 'long';
+              else if (last.c < orl && prevC >= orl) dirName = 'short';
+            }
+            if (dirName) {
+              const dir = dirName === 'long' ? 1 : -1;
+              const stop = (orh + orl) / 2;
+              const target = (dirName === 'long' ? orh : orl) + dir * 1.5 * range;
+              makeSignal({
+                id: dayId('orb-15min', sym, now), rule: 'orb-15min',
+                headline: `${sym}: broke ${dirName === 'long' ? 'above' : 'below'} the 15-min opening range`,
+                thesis: `First-15-minutes range ${orl.toFixed(2)}–${orh.toFixed(2)} (${((range / last.c) * 100).toFixed(2)}% wide); price ${last.c.toFixed(2)} broke ${dirName === 'long' ? 'out above the high' : 'down through the low'}. Ride the break with the stop at the range midpoint and a 1.5× range target — flat before the close.`,
+                direction: dirName, symbols: [sym], tvSymbol: sym, confidence: 'medium', event: null,
+                plan: { entry: last.c, stop, target, qty: roughQty(stop), horizonDays: 0.3 },
+              });
+            }
+          }
+        }
+
+        // --- overnight gap fade ---
+        if (needGap && Number.isFinite(q.prevClose) && q.prevClose > 0) {
+          const open = bars[0].o;
+          const gap = (open - q.prevClose) / q.prevClose;
+          const still = (last.c - q.prevClose) / q.prevClose;
+          if (Math.abs(gap) >= 0.004 && Math.abs(gap) <= 0.03 && Math.sign(still) === Math.sign(gap) && Math.abs(still) >= 0.0025) {
+            const dirName = gap > 0 ? 'short' : 'long';
+            const dir = dirName === 'long' ? 1 : -1;
+            const stop = last.c * (1 - dir * 0.6 * Math.abs(gap));
+            makeSignal({
+              id: dayId('gap-fade', sym, now), rule: 'gap-fade',
+              headline: `${sym}: fading the ${(gap * 100).toFixed(1)}% overnight gap ${gap > 0 ? 'up' : 'down'}`,
+              thesis: `${sym} opened at ${open.toFixed(2)}, ${(Math.abs(gap) * 100).toFixed(1)}% ${gap > 0 ? 'above' : 'below'} yesterday's close of ${q.prevClose.toFixed(2)}, and is still stretched. Moderate gaps tend to fill — target the prior close, stop at 60% of the gap beyond entry, flat by the close.`,
+              direction: dirName, symbols: [sym], tvSymbol: sym,
+              confidence: Math.abs(gap) >= 0.01 ? 'medium' : 'low', event: null,
+              plan: { entry: last.c, stop, target: q.prevClose, qty: roughQty(stop), horizonDays: 0.3 },
+            });
+          }
+        }
+
+        // --- VWAP reversion ---
+        if (needVwap) {
+          let pv = 0, vv = 0;
+          for (const b of bars) {
+            const tp = (b.h + b.l + b.c) / 3;
+            pv += tp * (b.v || 0);
+            vv += b.v || 0;
+          }
+          if (vv > 0) {
+            const vwap = pv / vv;
+            const dev = (last.c - vwap) / vwap;
+            const adr = clamp(q.adrPct ?? 0.015, 0.005, 0.06);
+            const thr = Math.max(0.003, 0.35 * adr); // stretch threshold scales with the symbol's volatility
+            if (Math.abs(dev) >= thr) {
+              const dirName = dev > 0 ? 'short' : 'long';
+              const dir = dirName === 'long' ? 1 : -1;
+              const dist = Math.abs(last.c - vwap);
+              const stop = last.c - dir * 0.6 * dist;
+              makeSignal({
+                id: dayId('vwap-revert', sym, now), rule: 'vwap-revert',
+                headline: `${sym}: ${(Math.abs(dev) * 100).toFixed(2)}% ${dev > 0 ? 'above' : 'below'} VWAP — fading back`,
+                thesis: `${sym} at ${last.c.toFixed(2)} is stretched ${(Math.abs(dev) * 100).toFixed(2)}% ${dev > 0 ? 'above' : 'below'} the session VWAP of ${vwap.toFixed(2)} (threshold ${(thr * 100).toFixed(2)}% for this symbol's volatility). Fade toward the institutional anchor — target VWAP, stop at 60% of the stretch beyond entry, flat by the close.`,
+                direction: dirName, symbols: [sym], tvSymbol: sym,
+                confidence: Math.abs(dev) >= 1.5 * thr ? 'medium' : 'low', event: null,
+                plan: { entry: last.c, stop, target: vwap, qty: roughQty(stop), horizonDays: 0.3 },
+              });
+            }
+          }
+        }
+      } catch (err) {
+        console.error(`[day] ${sym}: ${err.message}`);
+      }
+    }
+  }
+
+  // --- London-session FX breakout (the non-US-market account) ---
+  if (fxMarketOpen(now) && m >= 4 * 60 + 5 && m <= 10 * 60 + 30) {
+    for (const pair of FX_PAIRS) {
+      try {
+        if (sigExists(dayId('fx-session', pair, now))) continue;
+        const bars = (await getIntradayBars(pair)).filter((b) => b.ts >= dayStart);
+        const or = bars.filter((b) => b.ts >= dayStart + 3 * 3600000 && b.ts < dayStart + 4 * 3600000);
+        if (or.length < 6) continue;
+        const orh = Math.max(...or.map((b) => b.h));
+        const orl = Math.min(...or.map((b) => b.l));
+        const range = orh - orl;
+        const after = bars.filter((b) => b.ts >= dayStart + 4 * 3600000);
+        if (!after.length || range <= 0) continue;
+        const last = after[after.length - 1];
+        const prevC = after.length >= 2 ? after[after.length - 2].c : or[or.length - 1].c;
+        let dirName = null;
+        if (last.c > orh && prevC <= orh) dirName = 'long';
+        else if (last.c < orl && prevC >= orl) dirName = 'short';
+        if (!dirName) continue;
+        const dir = dirName === 'long' ? 1 : -1;
+        const stop = (orh + orl) / 2;
+        const target = (dirName === 'long' ? orh : orl) + dir * 1.5 * range;
+        const name = pair.replace('=X', '');
+        makeSignal({
+          id: dayId('fx-session', pair, now), rule: 'fx-session',
+          headline: `${name}: London-session range break ${dirName}`,
+          thesis: `${name} first-hour London range ${orl.toFixed(5)}–${orh.toFixed(5)}; price ${last.c.toFixed(5)} broke ${dirName === 'long' ? 'above' : 'below'} it. Session-momentum hypothesis on a non-US market — stop at the range midpoint, 1.5× range target, flat before the New York lunch. Unleveraged.`,
+          direction: dirName, symbols: [pair], tvSymbol: pair, confidence: 'medium', event: null,
+          plan: { entry: last.c, stop, target, qty: null, horizonDays: 0.3 },
+        });
+      } catch (err) {
+        console.error(`[day] ${pair}: ${err.message}`);
+      }
+    }
+  }
 }
 
 // ---------------------------------------------------------------- hyper scalper
@@ -1898,7 +2135,8 @@ async function runTechnicalBacktest(opts = {}) {
 async function replayRecordedSignals(opts = {}) {
   const variantName = STRATEGY_VARIANTS[opts.variant] ? opts.variant : 'base';
   const frictionOn = opts.friction !== false;
-  const rows = db.prepare("SELECT * FROM signals WHERE direction IN ('long','short') ORDER BY created_at").all();
+  const rows = db.prepare("SELECT * FROM signals WHERE direction IN ('long','short') ORDER BY created_at").all()
+    .filter((s) => !DAY_RULES.has(s.rule)); // intraday setups can't be replayed on daily bars
   const perRule = {};
   const errors = [];
   for (const s of rows) {
@@ -1925,7 +2163,9 @@ async function scoreUntakenSignals() {
   // Newest first: permanently unscoreable stragglers must never starve fresh
   // signals out of the LIMITed batch.
   const rows = db.prepare(`SELECT * FROM signals WHERE outcome_pnl IS NULL AND direction IN ('long','short')
-    AND status IN ('expired', 'dismissed', 'skipped') AND created_at < ? ORDER BY created_at DESC LIMIT 15`).all(Date.now() - 3 * 86400000);
+    AND status IN ('expired', 'dismissed', 'skipped') AND created_at < ?
+    AND rule NOT IN ('orb-15min', 'gap-fade', 'vwap-revert', 'fx-session')
+    ORDER BY created_at DESC LIMIT 15`).all(Date.now() - 3 * 86400000);
   for (const s of rows) {
     try {
       // Window sized from the signal's age so old signals stay scoreable.
@@ -2461,6 +2701,8 @@ server.listen(PORT, HOST, () => {
   setInterval(() => refreshPortwatch().catch((e) => console.error('[portwatch] refresh failed:', e.message)), 12 * 3600 * 1000);
   scanTechnicals().catch((e) => console.error('[tech] initial scan failed:', e.message));
   setInterval(() => scanTechnicals().catch((e) => console.error('[tech] scan failed:', e.message)), 60 * 60 * 1000);
+  scanDayTrades().catch((e) => console.error('[day] initial scan failed:', e.message));
+  setInterval(() => scanDayTrades().catch((e) => console.error('[day] scan failed:', e.message)), 3 * 60 * 1000);
   startBinanceStream();
   setInterval(() => scalperTick(), SCALP.tickMs);
   setInterval(() => { try { evolveScalper(); } catch (e) { console.error('[evolve] scalper:', e.message); } }, 60 * 1000);

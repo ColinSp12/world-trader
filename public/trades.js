@@ -51,7 +51,8 @@ function loadChart(symbol) {
   script.async = true;
   script.innerHTML = JSON.stringify({
     autosize: true,
-    symbol: currentSymbol,
+    // Yahoo FX symbols carry an =X suffix TradingView doesn't understand.
+    symbol: currentSymbol.replace(/=X$/, ''),
     interval: '60',
     timezone: 'exchange',
     theme: 'dark',

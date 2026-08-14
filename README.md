@@ -158,6 +158,16 @@ hourly on daily bars:
 | `rsi-reversal` | RSI(2) < 10 or > 90 | 1–2 session mean reversion |
 | `breakout-20` | close beyond prior 20-day high/low | range-expansion follow-through |
 
+A third, **day-trading family** works intraday on delayed 5-minute bars
+(SPY, QQQ, IWM, AAPL, NVDA, TSLA — always flat before the session ends):
+
+| Rule | Trigger | Idea |
+|---|---|---|
+| `orb-15min` | break of the first 15 minutes' high/low | opening-range breakout, stop at range midpoint, 1.5× range target |
+| `gap-fade` | opened 0.4–3% from yesterday's close, still stretched | moderate gaps tend to fill — target the prior close |
+| `vwap-revert` | price stretched from session VWAP (volatility-scaled) | fade back to the institutional anchor |
+| `fx-session` | break of London's first-hour range on EUR/GBP/AUD vs USD | session momentum on a non-US market, flat before NY lunch |
+
 And the **hyperactive family**: `momo-scalper`, a 24/7 crypto momentum scalper
 on real-time Binance prices whose parameters evolve in generations under real
 taker costs.

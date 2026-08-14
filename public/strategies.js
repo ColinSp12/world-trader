@@ -143,7 +143,8 @@ function card(a, base) {
 const FAMILIES = [
   ['event', 'Event-driven — world data', 'Signals from worldmonitor.app events, news threat scores, and IMF PortWatch ship counts.'],
   ['tech', 'Technical — price action', 'Classic rules scanned hourly over 12 liquid ETFs: momentum, mean reversion, breakouts. The control group.'],
-  ['hyper', 'Day trading — hyperactive', 'Real-time crypto scalping, dozens to hundreds of round trips a day, fees baked into every fill.'],
+  ['day', 'Day trading — intraday', 'Opening-range breakouts, gap fades, VWAP reversion on liquid US names, and a London-session FX account. Always flat before the session ends.'],
+  ['hyper', 'Scalping — hyperactive', 'Real-time crypto scalping at true taker costs, parameters evolving in generations.'],
 ];
 
 // ---- detail view: click a card to see just that strategy ----
