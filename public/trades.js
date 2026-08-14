@@ -556,6 +556,49 @@ async function loadAll() {
   }
 }
 
+// ---- live stream: prices tick in real time, fills refresh instantly ----
+const LIVE_SYMS = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'XRP-USD', 'DOGE-USD', 'LTC-USD'];
+const liveEls = new Map();
+{
+  const bar = document.getElementById('livebar');
+  for (const sym of LIVE_SYMS) {
+    const px = el('span', { class: 'lp-px' }, '—');
+    bar.append(el('button', {
+      class: 'live-pair', onclick: () => loadChart(sym.replace('-USD', 'USD')),
+    }, el('span', { class: 'lp-sym' }, sym.replace('-USD', '')), px));
+    liveEls.set(sym, { px, last: null });
+  }
+}
+
+let fillRefreshTimer = null;
+function connectStream() {
+  const es = new EventSource('/api/stream');
+  es.onmessage = (ev) => {
+    let d;
+    try { d = JSON.parse(ev.data); } catch { return; }
+    if (d.type === 'prices') {
+      for (const [sym, price] of Object.entries(d.prices || {})) {
+        const e = liveEls.get(sym);
+        if (!e || !Number.isFinite(price)) continue;
+        const dir = e.last == null ? 0 : Math.sign(price - e.last);
+        e.px.textContent = price >= 1000 ? price.toFixed(1) : price >= 10 ? price.toFixed(2) : price.toFixed(4);
+        if (dir) {
+          e.px.classList.remove('up', 'down');
+          void e.px.offsetWidth; // restart the flash animation
+          e.px.classList.add(dir > 0 ? 'up' : 'down');
+        }
+        e.last = price;
+      }
+    } else if (d.type === 'fill') {
+      // debounce: bursts of scalp fills collapse into one refresh
+      clearTimeout(fillRefreshTimer);
+      fillRefreshTimer = setTimeout(loadAll, 1200);
+    }
+  };
+  // EventSource reconnects automatically on error
+}
+connectStream();
+
 // ---- init ----
 const params = new URLSearchParams(location.search);
 const wantedSignal = params.get('signal');

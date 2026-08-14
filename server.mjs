@@ -494,6 +494,7 @@ function closeTrade(t, exitPrice, reason) {
   // Scalper fills log as 'scalp' so the toast layer (open/close only) stays quiet.
   logActivity(t.strategy === SCALP_RULE ? 'scalp' : 'close',
     `Closed ${t.side} ${t.qty} ${t.symbol} @ ${exitPrice.toFixed(2)} — ${reason} (P&L ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)})`);
+  broadcast('fill', { action: 'close', symbol: t.symbol });
   return pnl;
 }
 
@@ -627,7 +628,7 @@ async function autopilotTick() {
       const actionable = db.prepare(`SELECT * FROM signals WHERE status = 'new' AND plan_entry IS NOT NULL
         AND direction IN ('long','short') AND created_at > ? ORDER BY created_at DESC`).all(now - 24 * 3600 * 1000);
       for (const s of actionable) {
-        const openCount = db.prepare("SELECT COUNT(*) AS c FROM trades WHERE status = 'open' AND strategy != ?").get(SCALP_RULE).c;
+        const openCount = db.prepare("SELECT COUNT(*) AS c FROM trades WHERE status = 'open' AND COALESCE(strategy, '') != ?").get(SCALP_RULE).c;
         if (openCount >= MAX_OPEN_POSITIONS) { logActivity('skip', `Max ${MAX_OPEN_POSITIONS} open positions — ${s.tv_symbol} stays queued`); break; }
         // One position per symbol PER STRATEGY: each strategy runs its own
         // virtual account, so e.g. breakout can be long SPY while RSI is
@@ -658,6 +659,7 @@ async function autopilotTick() {
               now + plan.horizon * 24 * 3600 * 1000, s.id, s.headline, s.rule, variant);
           db.prepare("UPDATE signals SET status = 'taken' WHERE id = ?").run(s.id);
           logActivity('open', `AUTO opened ${s.direction} ${plan.qty} ${s.tv_symbol} @ ${plan.entry.toFixed(2)} · stop ${plan.stop.toFixed(2)} · target ${plan.target.toFixed(2)} · ${s.rule}/${variant} · exit by ${new Date(now + plan.horizon * 86400000).toISOString().slice(0, 10)} — ${s.headline}`);
+          broadcast('fill', { action: 'open', symbol: s.tv_symbol });
         } catch (err) {
           logActivity('info', `Entry failed for ${s.tv_symbol}: ${err.message}`);
         }
@@ -665,7 +667,8 @@ async function autopilotTick() {
 
       // 3. Manage: stop / target / time exits on open positions.
       // The scalper manages its own book on real-time prices — excluded here.
-      const open = db.prepare("SELECT * FROM trades WHERE status = 'open' AND strategy != ?").all(SCALP_RULE);
+      // COALESCE: NULL-strategy rows must NOT be excluded (SQLite 3VL trap).
+      const open = db.prepare("SELECT * FROM trades WHERE status = 'open' AND COALESCE(strategy, '') != ?").all(SCALP_RULE);
       if (open.length) {
         const quotes = await getQuotes([...new Set(open.map((t) => t.symbol))]);
         for (const t of open) {
@@ -806,9 +809,9 @@ const SCALP_PAIRS = {
 };
 const SCALP_TEST = process.env.SCALP_TEST === '1';
 const SCALP = {
-  tickMs: SCALP_TEST ? 5000 : 15000,
-  histLen: 24,
-  lookbackTicks: 4,                       // ~1 minute of momentum
+  tickMs: 500,                            // decision cadence
+  lookbackMs: 60 * 1000,                  // momentum window
+  histLen: 160,                           // ~80s of 500ms snapshots
   enterBps: SCALP_TEST ? 0.5 : 6,
   targetBps: 12,
   stopBps: 9,
@@ -816,58 +819,126 @@ const SCALP = {
   feeBps: 2,                              // per side, baked into fill prices
   notional: 5000,                         // per position, virtual dollars
 };
+const PAIR_TO_SYM = new Map(Object.entries(SCALP_PAIRS).map(([s, p]) => [p, s]));
 const scalpHist = new Map(); // symbol -> [{ts, price}]
+const livePrices = new Map(); // symbol -> { price, ts } — fed by Binance websocket
 let scalperOn = getSetting('scalper', '1') === '1';
 let scalperRunning = false;
+let lastRestFallback = 0;
+
+// ---- SSE: stream live prices + fill events to the browser ----
+const sseClients = new Set();
+function broadcast(type, payload) {
+  if (!sseClients.size) return;
+  const msg = `data: ${JSON.stringify({ type, ...payload })}\n\n`;
+  for (const client of sseClients) {
+    try { client.write(msg); } catch { sseClients.delete(client); }
+  }
+}
+
+// ---- Binance websocket: true push feed, mid of best bid/ask ----
+let binGen = 0;
+let binWs = null;
+function startBinanceStream() {
+  const gen = ++binGen;
+  let backoff = 3000;
+  const retry = () => { if (gen !== binGen) return; setTimeout(connect, backoff); backoff = Math.min(backoff * 2, 60000); };
+  const connect = () => {
+    if (gen !== binGen) return;
+    const streams = Object.values(SCALP_PAIRS).map((p) => `${p.toLowerCase()}@bookTicker`).join('/');
+    let ws;
+    try { ws = new WebSocket(`wss://stream.binance.com:9443/stream?streams=${streams}`); } catch { retry(); return; }
+    binWs = ws;
+    ws.onopen = () => { backoff = 3000; console.log('[scalper] binance stream connected'); };
+    ws.onmessage = (ev) => {
+      try {
+        const d = JSON.parse(ev.data)?.data;
+        if (!d?.s) return;
+        const bid = parseFloat(d.b), ask = parseFloat(d.a);
+        if (!Number.isFinite(bid) || !Number.isFinite(ask)) return;
+        const sym = PAIR_TO_SYM.get(d.s);
+        if (sym) livePrices.set(sym, { price: (bid + ask) / 2, ts: Date.now() });
+      } catch { /* malformed frame */ }
+    };
+    ws.onclose = retry;
+    ws.onerror = () => { try { ws.close(); } catch { /* already closed */ } };
+  };
+  connect();
+}
 
 async function scalperTick() {
-  if (!autopilotOn || !scalperOn || scalperRunning) return;
+  if (scalperRunning) return;
   scalperRunning = true;
   try {
-    const symsParam = encodeURIComponent(JSON.stringify(Object.values(SCALP_PAIRS)));
-    const data = await fetchJson(`https://api.binance.com/api/v3/ticker/price?symbols=${symsParam}`);
-    const prices = new Map(data.map((d) => [d.symbol, parseFloat(d.price)]));
     const now = Date.now();
-
-    for (const [sym, pair] of Object.entries(SCALP_PAIRS)) {
-      const px = prices.get(pair);
-      if (!Number.isFinite(px)) continue;
-      const hist = scalpHist.get(sym) || [];
-      hist.push({ ts: now, price: px });
-      while (hist.length > SCALP.histLen) hist.shift();
-      scalpHist.set(sym, hist);
-
-      const open = db.prepare("SELECT * FROM trades WHERE status = 'open' AND symbol = ? AND strategy = ?").get(sym, SCALP_RULE);
-      if (open) {
-        const dir = open.side === 'long' ? 1 : -1;
-        const exitFill = px * (1 - dir * SCALP.feeBps / 10000);
-        const movedBps = ((exitFill - open.entry_price) / open.entry_price) * 10000 * dir;
-        let reason = null;
-        if (movedBps >= SCALP.targetBps) reason = 'scalp target';
-        else if (movedBps <= -SCALP.stopBps) reason = 'scalp stop';
-        else if (now - open.opened_at >= SCALP.maxHoldMs) reason = 'scalp time';
-        if (reason) closeTrade(open, exitFill, reason);
-        continue;
-      }
-
-      if (hist.length <= SCALP.lookbackTicks) continue;
-      const back = hist[hist.length - 1 - SCALP.lookbackTicks];
-      const momBps = ((px - back.price) / back.price) * 10000;
-      if (Math.abs(momBps) < SCALP.enterBps) continue;
-      const side = momBps > 0 ? 'long' : 'short';
-      const dir = side === 'long' ? 1 : -1;
-      const fill = px * (1 + dir * SCALP.feeBps / 10000); // adverse fee on entry
-      const qty = +(SCALP.notional / fill).toFixed(6);
-      db.prepare(`INSERT INTO trades (opened_at, symbol, side, qty, entry_price, stop_price, target_price, expires_at, auto, signal_id, thesis, strategy, variant)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?, 'scalp')`)
-        .run(now, sym, side, qty, fill,
-          fill * (1 - dir * SCALP.stopBps / 10000),
-          fill * (1 + dir * SCALP.targetBps / 10000),
-          now + SCALP.maxHoldMs,
-          `1-min momentum ${momBps.toFixed(1)} bps`, SCALP_RULE);
-      logActivity('scalp', `SCALP ${side} ${qty} ${sym} @ ${fill.toFixed(2)} (momentum ${momBps > 0 ? '+' : ''}${momBps.toFixed(1)} bps)`);
+    // REST fallback if the websocket goes quiet (e.g. geo-blocked or dropped).
+    const allStale = livePrices.size === 0 || [...livePrices.values()].every((p) => now - p.ts > 10000);
+    if (allStale && now - lastRestFallback > 15000) {
+      lastRestFallback = now;
+      try {
+        const symsParam = encodeURIComponent(JSON.stringify(Object.values(SCALP_PAIRS)));
+        const data = await fetchJson(`https://api.binance.com/api/v3/ticker/price?symbols=${symsParam}`);
+        for (const d of data) {
+          const sym = PAIR_TO_SYM.get(d.symbol);
+          const px = parseFloat(d.price);
+          if (sym && Number.isFinite(px)) livePrices.set(sym, { price: px, ts: now });
+        }
+      } catch { /* next fallback window retries */ }
     }
-  } catch { /* transient price failure — next tick retries */ } finally {
+
+    if (autopilotOn && scalperOn) {
+      for (const sym of Object.keys(SCALP_PAIRS)) {
+        const live = livePrices.get(sym);
+        if (!live || now - live.ts > 10000) continue;
+        const px = live.price;
+        const hist = scalpHist.get(sym) || [];
+        hist.push({ ts: now, price: px });
+        while (hist.length > SCALP.histLen) hist.shift();
+        scalpHist.set(sym, hist);
+
+        const open = db.prepare("SELECT * FROM trades WHERE status = 'open' AND symbol = ? AND strategy = ?").get(sym, SCALP_RULE);
+        if (open) {
+          const dir = open.side === 'long' ? 1 : -1;
+          const exitFill = px * (1 - dir * SCALP.feeBps / 10000);
+          const movedBps = ((exitFill - open.entry_price) / open.entry_price) * 10000 * dir;
+          let reason = null;
+          if (movedBps >= SCALP.targetBps) reason = 'scalp target';
+          else if (movedBps <= -SCALP.stopBps) reason = 'scalp stop';
+          else if (now - open.opened_at >= SCALP.maxHoldMs) reason = 'scalp time';
+          if (reason) closeTrade(open, exitFill, reason); // closeTrade broadcasts the fill
+          continue;
+        }
+
+        // momentum vs the snapshot ~lookbackMs ago
+        const cutoff = now - SCALP.lookbackMs;
+        let back = null;
+        for (const h of hist) { if (h.ts <= cutoff) back = h; else break; }
+        if (!back) continue;
+        const momBps = ((px - back.price) / back.price) * 10000;
+        if (Math.abs(momBps) < SCALP.enterBps) continue;
+        const side = momBps > 0 ? 'long' : 'short';
+        const dir = side === 'long' ? 1 : -1;
+        const fill = px * (1 + dir * SCALP.feeBps / 10000); // adverse fee on entry
+        const qty = +(SCALP.notional / fill).toFixed(6);
+        db.prepare(`INSERT INTO trades (opened_at, symbol, side, qty, entry_price, stop_price, target_price, expires_at, auto, signal_id, thesis, strategy, variant)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?, 'scalp')`)
+          .run(now, sym, side, qty, fill,
+            fill * (1 - dir * SCALP.stopBps / 10000),
+            fill * (1 + dir * SCALP.targetBps / 10000),
+            now + SCALP.maxHoldMs,
+            `1-min momentum ${momBps.toFixed(1)} bps`, SCALP_RULE);
+        logActivity('scalp', `SCALP ${side} ${qty} ${sym} @ ${fill.toFixed(2)} (momentum ${momBps > 0 ? '+' : ''}${momBps.toFixed(1)} bps)`);
+        broadcast('fill', { action: 'open', symbol: sym });
+      }
+    }
+
+    broadcast('prices', {
+      ts: now,
+      prices: Object.fromEntries([...livePrices].map(([s, v]) => [s, v.price])),
+    });
+  } catch (err) {
+    console.error('[scalper] tick failed:', err.message);
+  } finally {
     scalperRunning = false;
   }
 }
@@ -1232,6 +1303,13 @@ const server = http.createServer(async (req, res) => {
         ships: list,
       });
     }
+    if (p === '/api/stream' && req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+      res.write(': connected\n\n');
+      sseClients.add(res);
+      req.on('close', () => sseClients.delete(res));
+      return;
+    }
     if (p === '/api/strategy-accounts' && req.method === 'GET') {
       // Each strategy presented as its own virtual $100k account: balance =
       // base + its own realized P&L + unrealized on its open positions.
@@ -1373,8 +1451,8 @@ const server = http.createServer(async (req, res) => {
       }
       const stop = Number.isFinite(Number(b.stop_price)) && Number(b.stop_price) > 0 ? Number(b.stop_price) : null;
       const target = Number.isFinite(Number(b.target_price)) && Number(b.target_price) > 0 ? Number(b.target_price) : null;
-      const info = db.prepare(`INSERT INTO trades (opened_at, symbol, side, qty, entry_price, stop_price, target_price, expires_at, auto, signal_id, thesis)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`)
+      const info = db.prepare(`INSERT INTO trades (opened_at, symbol, side, qty, entry_price, stop_price, target_price, expires_at, auto, signal_id, thesis, strategy, variant)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 'manual', 'base')`)
         .run(Date.now(), symbol, side, qty, entry, stop, target, null, b.signal_id || null, b.thesis || null);
       if (b.signal_id) db.prepare("UPDATE signals SET status = 'taken' WHERE id = ?").run(String(b.signal_id));
       logActivity('open', `MANUAL opened ${side} ${qty} ${symbol} @ ${entry.toFixed(2)}${stop ? ` · stop ${stop.toFixed(2)}` : ''}${target ? ` · target ${target.toFixed(2)}` : ''}`);
@@ -1415,7 +1493,8 @@ server.listen(PORT, () => {
   setInterval(() => refreshPortwatch().catch((e) => console.error('[portwatch] refresh failed:', e.message)), 12 * 3600 * 1000);
   scanTechnicals().catch((e) => console.error('[tech] initial scan failed:', e.message));
   setInterval(() => scanTechnicals().catch((e) => console.error('[tech] scan failed:', e.message)), 60 * 60 * 1000);
+  startBinanceStream();
   setInterval(() => scalperTick(), SCALP.tickMs);
-  console.log(`[scalper] ${scalperOn ? 'active' : 'paused'} — ${Object.keys(SCALP_PAIRS).length} pairs, tick ${SCALP.tickMs / 1000}s${SCALP_TEST ? ' (TEST MODE)' : ''}`);
+  console.log(`[scalper] ${scalperOn ? 'active' : 'paused'} — ${Object.keys(SCALP_PAIRS).length} pairs streaming, decisions every ${SCALP.tickMs}ms${SCALP_TEST ? ' (TEST MODE)' : ''}`);
   if (aisKey) startAisStream();
 });
