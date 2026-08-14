@@ -275,8 +275,11 @@ input:focus, select:focus { outline: 1px solid var(--accent); }
   color: #9085e9; font: inherit; line-height: inherit;
 }
 .legend-toggle.off { color: var(--muted); text-decoration: line-through; }
+.legend-toggle.ships { color: #c98500; }
+.legend-toggle.ships.off { color: var(--muted); }
 .plane-icon { background: none; border: none; }
 .plane-icon span {
   display: inline-block; font-size: 15px; line-height: 18px; color: #9085e9;
   text-shadow: 0 0 3px rgba(0, 0, 0, 0.9);
 }
+.plane-icon.civ span { color: #7d7c76; font-size: 12px; }

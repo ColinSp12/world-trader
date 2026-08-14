@@ -659,16 +659,16 @@ async function autopilotTick() {
 }
 
 // ---------------------------------------------------------------- flights
-// Live military aircraft from adsb.lol's open API — a map garnish, fetched
-// on demand (only while someone is watching the map) and cached 45s.
+// Live aircraft from adsb.lol's open API — fetched on demand (only while
+// someone is watching the map). Global military feed, plus area queries for
+// all traffic (civilian included) when the map is zoomed in.
 const flightCache = { items: [], fetchedAt: 0 };
 const FLIGHT_TTL_MS = 45 * 1000;
+const areaFlightCache = new Map(); // "lat,lon,r" -> { items, fetchedAt }
 
-async function getFlights() {
-  if (Date.now() - flightCache.fetchedAt < FLIGHT_TTL_MS) return flightCache.items;
-  const data = await fetchJson('https://api.adsb.lol/v2/mil');
+function normalizeAircraft(ac) {
   const items = [];
-  for (const a of data.ac || []) {
+  for (const a of ac || []) {
     if (!Number.isFinite(a.lat) || !Number.isFinite(a.lon)) continue;
     items.push({
       hex: a.hex,
@@ -678,12 +678,123 @@ async function getFlights() {
       alt: Number.isFinite(a.alt_baro) ? a.alt_baro : (a.alt_baro === 'ground' ? 0 : null),
       speed: Number.isFinite(a.gs) ? Math.round(a.gs) : null,
       track: Number.isFinite(a.track) ? a.track : 0,
+      mil: Boolean((a.dbFlags || 0) & 1),
       lat: a.lat, lon: a.lon,
     });
   }
-  flightCache.items = items;
-  flightCache.fetchedAt = Date.now();
   return items;
+}
+
+async function getFlights() {
+  if (Date.now() - flightCache.fetchedAt < FLIGHT_TTL_MS) return flightCache.items;
+  const data = await fetchJson('https://api.adsb.lol/v2/mil');
+  flightCache.items = normalizeAircraft(data.ac).map((f) => ({ ...f, mil: true }));
+  flightCache.fetchedAt = Date.now();
+  return flightCache.items;
+}
+
+async function getAreaFlights(lat, lon, radiusNm) {
+  const r = Math.min(Math.max(Math.round(radiusNm), 10), 250);
+  const key = `${lat.toFixed(1)},${lon.toFixed(1)},${r}`;
+  const hit = areaFlightCache.get(key);
+  if (hit && Date.now() - hit.fetchedAt < 30 * 1000) return hit.items;
+  const data = await fetchJson(`https://api.adsb.lol/v2/point/${lat}/${lon}/${r}`);
+  const items = normalizeAircraft(data.ac);
+  areaFlightCache.set(key, { items, fetchedAt: Date.now() });
+  if (areaFlightCache.size > 24) {
+    const oldest = [...areaFlightCache.entries()].sort((a, b) => a[1].fetchedAt - b[1].fetchedAt)[0][0];
+    areaFlightCache.delete(oldest);
+  }
+  return items;
+}
+
+// ---------------------------------------------------------------- ships (AIS)
+// Two sources: with a free aisstream.io key (env AISSTREAM_KEY) we stream
+// live positions for the world's shipping chokepoints; without one we poll
+// Finland's open Digitraffic feed (Baltic Sea) so the layer works with zero
+// setup. Vessels are kept in memory keyed by MMSI and aged out after 20 min.
+const AISSTREAM_KEY = process.env.AISSTREAM_KEY || '';
+const ships = new Map();
+const SHIP_MAX_AGE_MS = 20 * 60 * 1000;
+const CHOKEPOINT_BOXES = [
+  [[23.5, 54.0], [27.5, 58.5]],   // Strait of Hormuz
+  [[11.0, 32.0], [31.0, 44.5]],   // Red Sea + Bab el-Mandeb + Suez approaches
+  [[-1.5, 98.0], [6.5, 105.5]],   // Malacca + Singapore Strait
+  [[7.5, -81.5], [10.5, -77.5]],  // Panama Canal
+  [[40.0, 26.0], [42.0, 30.5]],   // Bosporus
+  [[22.0, 117.0], [26.5, 122.5]], // Taiwan Strait
+  [[35.0, -7.0], [37.0, -4.0]],   // Gibraltar
+  [[49.5, -2.0], [51.5, 3.0]],    // Dover Strait / Channel
+];
+
+const digiState = { fetchedAt: 0, namesFetchedAt: 0, names: new Map() };
+async function refreshDigitraffic() {
+  if (Date.now() - digiState.fetchedAt < 75 * 1000) return;
+  digiState.fetchedAt = Date.now(); // set first so concurrent requests don't stampede
+  const dtHeaders = { 'Digitraffic-User': 'world-trader-experiment' };
+  const data = await fetchJson('https://meri.digitraffic.fi/api/ais/v1/locations', dtHeaders);
+  for (const f of data.features || []) {
+    const [lon, lat] = f.geometry?.coordinates || [];
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+    const p = f.properties || {};
+    ships.set(f.mmsi, {
+      mmsi: f.mmsi,
+      name: digiState.names.get(f.mmsi) || String(f.mmsi),
+      lat, lon,
+      speed: Number.isFinite(p.sog) ? p.sog : null,
+      course: Number.isFinite(p.cog) ? p.cog : null,
+      ts: p.timestampExternal || Date.now(),
+    });
+  }
+  if (Date.now() - digiState.namesFetchedAt > 15 * 60 * 1000) {
+    digiState.namesFetchedAt = Date.now();
+    try {
+      const meta = await fetchJson('https://meri.digitraffic.fi/api/ais/v1/vessels', dtHeaders);
+      for (const v of meta) if (v.name) digiState.names.set(v.mmsi, v.name);
+      for (const s of ships.values()) {
+        const n = digiState.names.get(s.mmsi);
+        if (n) s.name = n;
+      }
+    } catch { /* names are cosmetic */ }
+  }
+}
+
+function startAisStream() {
+  let backoff = 5000;
+  const retry = () => { setTimeout(connect, backoff); backoff = Math.min(backoff * 2, 120000); };
+  const connect = () => {
+    let ws;
+    try { ws = new WebSocket('wss://stream.aisstream.io/v0/stream'); } catch { retry(); return; }
+    ws.onopen = () => {
+      backoff = 5000;
+      ws.send(JSON.stringify({
+        APIKey: AISSTREAM_KEY,
+        BoundingBoxes: CHOKEPOINT_BOXES,
+        FilterMessageTypes: ['PositionReport'],
+      }));
+      console.log('[ships] aisstream connected (chokepoint coverage)');
+    };
+    ws.onmessage = (ev) => {
+      try {
+        const m = JSON.parse(ev.data);
+        if (m.MessageType !== 'PositionReport') return;
+        const md = m.MetaData || {};
+        const pr = m.Message?.PositionReport || {};
+        if (!md.MMSI || !Number.isFinite(pr.Latitude)) return;
+        ships.set(md.MMSI, {
+          mmsi: md.MMSI,
+          name: (md.ShipName || '').trim() || String(md.MMSI),
+          lat: pr.Latitude, lon: pr.Longitude,
+          speed: Number.isFinite(pr.Sog) ? pr.Sog : null,
+          course: Number.isFinite(pr.Cog) ? pr.Cog : null,
+          ts: Date.now(),
+        });
+      } catch { /* ignore malformed frames */ }
+    };
+    ws.onclose = retry;
+    ws.onerror = () => { try { ws.close(); } catch { /* already closed */ } };
+  };
+  connect();
 }
 
 // ---------------------------------------------------------------- equity history
@@ -798,12 +909,36 @@ const server = http.createServer(async (req, res) => {
       });
     }
     if (p === '/api/flights' && req.method === 'GET') {
+      // Note: Number(null) === 0, so missing params must stay NaN explicitly.
+      const num = (name) => { const v = url.searchParams.get(name); return v === null || v === '' ? NaN : Number(v); };
+      const lat = num('lat');
+      const lon = num('lon');
+      const radius = num('radius');
       try {
+        if (Number.isFinite(lat) && Number.isFinite(lon) && Math.abs(lat) <= 90 && Math.abs(lon) <= 180) {
+          return json(res, 200, { flights: await getAreaFlights(lat, lon, Number.isFinite(radius) ? radius : 250) });
+        }
         return json(res, 200, { fetchedAt: flightCache.fetchedAt, flights: await getFlights() });
       } catch (err) {
         // serve last-known flights rather than failing the map
         return json(res, 200, { fetchedAt: flightCache.fetchedAt, flights: flightCache.items, error: err.message });
       }
+    }
+    if (p === '/api/ships' && req.method === 'GET') {
+      if (!AISSTREAM_KEY) {
+        try { await refreshDigitraffic(); } catch (err) { /* serve what we have */ }
+      }
+      const now = Date.now();
+      for (const [k, s] of ships) if (now - s.ts > SHIP_MAX_AGE_MS) ships.delete(k);
+      let list = [...ships.values()];
+      if (list.length > 2000) list = list.sort((a, b) => (b.speed ?? 0) - (a.speed ?? 0)).slice(0, 2000);
+      return json(res, 200, {
+        source: AISSTREAM_KEY
+          ? 'aisstream.io — live chokepoints (Hormuz, Suez, Malacca, Panama, Bosporus, Taiwan, Gibraltar, Dover)'
+          : 'Digitraffic open AIS — Baltic Sea demo. Set AISSTREAM_KEY (free at aisstream.io) for global chokepoint coverage.',
+        count: list.length,
+        ships: list,
+      });
     }
     if (p === '/api/equity-history' && req.method === 'GET') {
       return json(res, 200, {
@@ -896,4 +1031,5 @@ server.listen(PORT, () => {
     .catch((e) => console.error('[events] initial refresh failed:', e.message));
   setInterval(() => refreshEvents().catch((e) => console.error('[events] refresh failed:', e.message)), EVENT_REFRESH_MS);
   setInterval(() => autopilotTick(), 60 * 1000);
+  if (AISSTREAM_KEY) startAisStream();
 });

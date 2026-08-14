@@ -62,8 +62,16 @@ Node path inside if yours differs).
 - **Autopilot activity feed** — every plan, entry, exit, skip, and sizing
   adjustment, with reasons.
 - **Export CSV** button on the blotter for analysis elsewhere.
-- **Map garnish**: live military aircraft from adsb.lol's open API (toggle in
-  the map legend), alongside the event markers.
+- **Live air & sea layers** (toggles in the map legend):
+  - **✈ Aircraft** — worldwide military flights via adsb.lol's open API; zoom
+    in (level 5+) and the layer switches to *all* air traffic around your
+    viewport, civilian planes in grey, military in violet.
+  - **⚓ Ships** — live AIS positions. Works out of the box with Finland's
+    open Digitraffic feed (Baltic Sea). For live coverage of the world's
+    shipping chokepoints (Hormuz, Suez/Red Sea, Malacca, Panama, Bosporus,
+    Taiwan Strait, Gibraltar, Dover), grab a free API key at
+    [aisstream.io](https://aisstream.io) and start the server with
+    `set AISSTREAM_KEY=your_key` — the map switches automatically.
 
 ## Pages
 

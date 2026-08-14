@@ -2,13 +2,15 @@ import { el, api, timeAgo, safeUrl, fmtPrice, KIND_LABEL, SEV_LABEL } from '/sha
 
 const KIND_COLOR = { quake: '#3987e5', unrest: '#d95926', conflict: '#d95926', natural: '#199e70' };
 
-const map = L.map('map', { worldCopyJump: true, zoomControl: true }).setView([25, 15], 2);
+// preferCanvas keeps 1000+ ship markers cheap to render
+const map = L.map('map', { worldCopyJump: true, zoomControl: true, preferCanvas: true }).setView([25, 15], 2);
 L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
   attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
   subdomains: 'abcd', maxZoom: 12,
 }).addTo(map);
 
 let flightsOn = true;
+let shipsOn = true;
 const legend = L.control({ position: 'bottomleft' });
 legend.onAdd = () => {
   const div = document.createElement('div');
@@ -18,34 +20,54 @@ legend.onAdd = () => {
   }
   div.append(el('button', {
     class: 'legend-toggle', id: 'flights-toggle',
+    title: 'military worldwide · all air traffic when zoomed in',
     onclick: () => {
       flightsOn = !flightsOn;
       if (!flightsOn) flightLayer.clearLayers();
       else refreshFlights();
       updateFlightsToggle(null);
     },
-  }, '✈ military flights'));
+  }, '✈ aircraft'));
+  div.append(el('button', {
+    class: 'legend-toggle ships', id: 'ships-toggle',
+    onclick: () => {
+      shipsOn = !shipsOn;
+      if (!shipsOn) shipLayer.clearLayers();
+      else refreshShips();
+      updateShipsToggle(null);
+    },
+  }, '⚓ ships'));
   div.append(el('div', { style: 'color: var(--muted)' }, 'marker size = severity'));
   L.DomEvent.disableClickPropagation(div);
   return div;
 };
 legend.addTo(map);
 
-function updateFlightsToggle(count) {
+function updateFlightsToggle(counts) {
   const btn = document.getElementById('flights-toggle');
   if (!btn) return;
   btn.classList.toggle('off', !flightsOn);
-  btn.textContent = flightsOn ? `✈ military flights${count != null ? ` (${count})` : ''}` : '✈ military flights — off';
+  btn.textContent = flightsOn ? `✈ aircraft${counts ? ` (${counts})` : ''}` : '✈ aircraft — off';
+}
+
+function updateShipsToggle(count, source) {
+  const btn = document.getElementById('ships-toggle');
+  if (!btn) return;
+  btn.classList.toggle('off', !shipsOn);
+  if (source) btn.title = source;
+  btn.textContent = shipsOn ? `⚓ ships${count != null ? ` (${count})` : ''}` : '⚓ ships — off';
 }
 
 const markerLayer = L.layerGroup().addTo(map);
 const markerById = new Map();
 const flightLayer = L.layerGroup().addTo(map);
 
+const shipLayer = L.layerGroup().addTo(map);
+
 // U+2708 points ~45° right of north in most fonts, hence the -45 offset.
-function planeIcon(track) {
+function planeIcon(track, mil) {
   return L.divIcon({
-    className: 'plane-icon',
+    className: 'plane-icon' + (mil ? '' : ' civ'),
     html: `<span style="transform: rotate(${Math.round(track - 45)}deg)">✈</span>`,
     iconSize: [18, 18], iconAnchor: [9, 9],
   });
@@ -54,21 +76,61 @@ function planeIcon(track) {
 async function refreshFlights() {
   if (!flightsOn) return;
   try {
-    const d = await api('/api/flights');
+    let d;
+    // Zoomed in: all traffic (civilian + military) around the viewport.
+    // Zoomed out: worldwide military only — global civilian would be 10k+ planes.
+    if (map.getZoom() >= 5) {
+      const c = map.getCenter();
+      const ne = map.getBounds().getNorthEast();
+      const radiusNm = Math.min(250, Math.max(30, Math.round(c.distanceTo(ne) / 1852)));
+      d = await api(`/api/flights?lat=${c.lat.toFixed(2)}&lon=${c.lng.toFixed(2)}&radius=${radiusNm}`);
+    } else {
+      d = await api('/api/flights');
+    }
     if (!flightsOn) return; // toggled off while fetching
     flightLayer.clearLayers();
+    let mil = 0;
     for (const f of d.flights) {
-      const m = L.marker([f.lat, f.lon], { icon: planeIcon(f.track), keyboard: false });
+      if (f.mil) mil++;
+      const m = L.marker([f.lat, f.lon], { icon: planeIcon(f.track, f.mil), keyboard: false });
       m.bindPopup(el('div', {},
         el('div', { style: 'font-weight:600' }, `✈ ${f.callsign}`),
         el('div', { class: 'm' }, [f.type, f.reg, f.alt != null ? `${f.alt.toLocaleString()} ft` : null, f.speed != null ? `${f.speed} kt` : null].filter(Boolean).join(' · ')),
-        el('div', { class: 'm' }, 'military · live via adsb.lol'),
+        el('div', { class: 'm' }, `${f.mil ? 'military' : 'civilian'} · live via adsb.lol`),
       ));
       m.addTo(flightLayer);
     }
-    updateFlightsToggle(d.flights.length);
+    const civ = d.flights.length - mil;
+    updateFlightsToggle(civ ? `${mil} mil · ${civ} civ` : `${mil} mil`);
   } catch { /* keep last markers; retry next cycle */ }
 }
+
+async function refreshShips() {
+  if (!shipsOn) return;
+  try {
+    const d = await api('/api/ships');
+    if (!shipsOn) return;
+    shipLayer.clearLayers();
+    for (const s of d.ships) {
+      const m = L.circleMarker([s.lat, s.lon], {
+        radius: 2.5, color: '#c98500', weight: 1, fillColor: '#c98500', fillOpacity: 0.75,
+      });
+      m.bindPopup(el('div', {},
+        el('div', { style: 'font-weight:600' }, `⚓ ${s.name}`),
+        el('div', { class: 'm' }, [`MMSI ${s.mmsi}`, s.speed != null ? `${s.speed.toFixed(1)} kn` : null, s.course != null ? `course ${Math.round(s.course)}°` : null].filter(Boolean).join(' · ')),
+        el('div', { class: 'm' }, timeAgo(s.ts)),
+      ));
+      m.addTo(shipLayer);
+    }
+    updateShipsToggle(d.count, d.source);
+  } catch { /* keep last markers; retry next cycle */ }
+}
+
+let viewportTimer;
+map.on('moveend zoomend', () => {
+  clearTimeout(viewportTimer);
+  viewportTimer = setTimeout(refreshFlights, 600);
+});
 
 function popupContent(e) {
   const wrap = el('div', {},
@@ -188,5 +250,7 @@ async function refresh() {
 
 refresh();
 refreshFlights();
+refreshShips();
 setInterval(refresh, 60 * 1000);
 setInterval(refreshFlights, 60 * 1000);
+setInterval(refreshShips, 60 * 1000);
