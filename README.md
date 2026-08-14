@@ -99,6 +99,19 @@ Transparent heuristics, deduped per situation per day, stored in SQLite:
 | `headline-risk` | high-threat news, importance ≥55 | watch the story's tickers or sector proxies |
 | `chokepoint-transit-drop` | IMF PortWatch daily transits ≥30% below 28-day avg | long shipping/oil per chokepoint |
 
+A second, purely **technical family** (the control group) scans 12 liquid ETFs
+hourly on daily bars:
+
+| Rule | Trigger | Idea |
+|---|---|---|
+| `ma-cross` | fresh 5-day/20-day EMA cross | short-term trend following |
+| `rsi-reversal` | RSI(2) < 10 or > 90 | 1–2 session mean reversion |
+| `breakout-20` | close beyond prior 20-day high/low | range-expansion follow-through |
+
+The Strategies page shows every rule as its own virtual $100k account,
+grouped by family, so the event-driven and technical stables compete on
+identical infrastructure.
+
 Edit the rules in `server.mjs` — they are ~80 lines of plain JS and meant to be
 tinkered with.
 

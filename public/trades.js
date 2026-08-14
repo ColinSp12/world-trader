@@ -449,6 +449,58 @@ function showBlotterTab(which) {
   document.getElementById('tab-perf').classList.toggle('active', which === 'perf');
 }
 
+// ---- trade log (broker-style: green buys, red sells, signed P&L) ----
+document.getElementById('tab-log').addEventListener('click', () => showLogTab('log'));
+document.getElementById('tab-engine').addEventListener('click', () => showLogTab('engine'));
+function showLogTab(which) {
+  document.getElementById('tradelog').hidden = which !== 'log';
+  document.getElementById('activity').hidden = which !== 'engine';
+  document.getElementById('tab-log').classList.toggle('active', which === 'log');
+  document.getElementById('tab-engine').classList.toggle('active', which === 'engine');
+}
+
+function renderTradeLog(trades) {
+  const box = document.getElementById('tradelog');
+  box.replaceChildren();
+  const events = [];
+  for (const t of trades) {
+    events.push({
+      ts: t.opened_at,
+      buy: t.side === 'long',
+      label: `${t.side === 'long' ? 'BUY' : 'SELL SHORT'} ${t.qty} ${t.symbol} @ ${fmtPrice(t.entry_price)}`,
+      tag: t.auto ? `${t.strategy || ''}` : 'manual',
+    });
+    if (t.status === 'closed') {
+      const pct = t.entry_price * t.qty ? (t.pnl / (t.entry_price * t.qty)) * 100 : null;
+      events.push({
+        ts: t.closed_at,
+        buy: t.side !== 'long',
+        label: `${t.side === 'long' ? 'SELL' : 'BUY TO COVER'} ${t.qty} ${t.symbol} @ ${fmtPrice(t.exit_price)}`,
+        pnl: t.pnl, pct,
+        tag: t.exit_reason || 'closed',
+      });
+    }
+  }
+  if (!events.length) {
+    box.append(el('div', { class: 'empty' }, 'Trade fills appear here — green for buys, red for sells, with profit on every exit.'));
+    return;
+  }
+  events.sort((a, b) => b.ts - a.ts);
+  for (const ev of events) {
+    box.append(el('div', { class: `log-row ${ev.buy ? 'buy' : 'sell'}` },
+      el('span', { class: 'log-arrow' }, ev.buy ? '▲' : '▼'),
+      el('span', { class: 'log-main' },
+        el('span', { class: 'log-label' }, ev.label),
+        ev.pnl != null
+          ? el('span', { class: `log-pnl ${ev.pnl >= 0 ? 'pnl-up' : 'pnl-down'}` },
+              `${fmtPnl(ev.pnl)}${Number.isFinite(ev.pct) ? ` (${ev.pct >= 0 ? '+' : ''}${ev.pct.toFixed(2)}%)` : ''}`)
+          : null,
+        el('span', { class: 'log-meta' }, `${ev.tag} · ${timeAgo(ev.ts)}`),
+      ),
+    ));
+  }
+}
+
 // ---- activity feed ----
 const KIND_ICON = { open: '▶', close: '■', plan: '◇', skip: '⏭', info: '·' };
 function renderActivity(items) {
@@ -486,6 +538,7 @@ async function loadAll() {
     equityHistory = eq.history;
     renderTiles(trades.summary);
     renderBlotter(trades);
+    renderTradeLog(trades.trades);
     renderActivity(activity.activity);
     renderPerformance(perf.performance);
     watchActivity(activity.activity);

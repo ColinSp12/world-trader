@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>World Trader — Strategies</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🌍</text></svg>">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="brand"><span class="globe">🌍</span>World Trader</span>
+  <span class="paper-badge">PAPER TRADING — NO REAL MONEY</span>
+  <nav class="pages">
+    <a href="/">Map</a>
+    <a href="/trades">Trades</a>
+    <a href="/strategies" class="active">Strategies</a>
+  </nav>
+  <span class="status" id="status"></span>
+</header>
+<main class="strategies">
+  <p class="strategies-intro">Every strategy runs as its own virtual <b>$100,000</b> account — its balance moves only on its own trades. The autopilot trades them all in parallel; over time the curves show which ones actually earn. <span class="dim-note">Balances combine realized results and open-position marks.</span></p>
+  <div class="strategy-grid" id="grid"></div>
+</main>
+<script type="module" src="/strategies.js"></script>
+</body>
+</html>

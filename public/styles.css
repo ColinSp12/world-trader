@@ -278,6 +278,45 @@ dialog h3 { margin: 0 0 4px; font-size: 15px; }
 /* equity chart */
 .equity-wrap { padding: 10px 14px 0; }
 .equity-chart { width: 100%; height: auto; display: block; }
+
+/* trade log */
+.log-row {
+  display: flex; gap: 9px; align-items: baseline;
+  padding: 8px 12px; border-bottom: 1px solid var(--grid);
+  border-left: 3px solid transparent; font-size: 12.5px;
+}
+.log-row.buy { border-left-color: var(--up); }
+.log-row.sell { border-left-color: var(--down); }
+.log-row.buy .log-arrow, .log-row.buy .log-label { color: var(--up); }
+.log-row.sell .log-arrow, .log-row.sell .log-label { color: var(--down); }
+.log-label { font-weight: 600; font-variant-numeric: tabular-nums; }
+.log-main { display: flex; flex-direction: column; gap: 1px; }
+.log-pnl { font-weight: 650; font-variant-numeric: tabular-nums; }
+.log-meta { color: var(--muted); font-size: 11px; }
+
+/* strategies page */
+main.strategies { flex: 1; overflow-y: auto; padding: 16px; }
+.strategies-intro { max-width: 860px; margin: 0 0 16px; color: var(--ink-2); font-size: 13.5px; }
+.strategy-grid { display: flex; flex-direction: column; gap: 6px; }
+.family-head { display: flex; align-items: baseline; gap: 12px; margin: 14px 2px 8px; flex-wrap: wrap; }
+.family-head h2 { margin: 0; font-size: 15px; }
+.family-grid {
+  display: grid; gap: 14px;
+  grid-template-columns: repeat(auto-fill, minmax(330px, 1fr));
+}
+.strategy-card {
+  background: var(--surface); border: 1px solid var(--hairline); border-radius: 10px;
+  padding: 14px 16px; display: flex; flex-direction: column; gap: 8px;
+}
+.strategy-card .head { display: flex; align-items: baseline; gap: 8px; }
+.strategy-card h3 { margin: 0; font-size: 14.5px; flex: 1; }
+.strategy-card .balance-row { display: flex; align-items: baseline; gap: 10px; }
+.strategy-card .balance { font-size: 24px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.strategy-card .delta { font-weight: 600; font-variant-numeric: tabular-nums; }
+.strategy-card .delta.dim { color: var(--muted); }
+.balance-curve { width: 100%; height: auto; display: block; }
+.strategy-card .stats { color: var(--ink-2); font-size: 12px; }
+.strategy-card .desc { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
 input[type="text"], input[type="number"], select {
   background: var(--page); color: var(--ink);
   border: 1px solid var(--hairline); border-radius: 6px;

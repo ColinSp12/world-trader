@@ -495,6 +495,21 @@ function closeTrade(t, exitPrice, reason) {
   return pnl;
 }
 
+// Human-readable identity for each strategy, shown on the Strategies page.
+// family: 'event' = driven by world data; 'tech' = classic price-action rules.
+const STRATEGY_META = {
+  'oil-producer-unrest': { family: 'event', title: 'Oil Producer Unrest', desc: 'Severe unrest or conflict inside a major oil-producing country → long crude and energy equities (USO, XLE). Bets on a supply-disruption risk premium appearing while the situation is live.' },
+  'chokepoint-disruption': { family: 'event', title: 'Chokepoint Unrest', desc: 'Severe unrest near a maritime chokepoint (Red Sea, Hormuz, Suez, Panama…) → long tankers/shipping and crude (FRO, ZIM, USO). Disruption raises freight rates and oil.' },
+  'chokepoint-transit-drop': { family: 'event', title: 'Transit Drop (PortWatch)', desc: 'IMF PortWatch daily transit counts fall ≥30% below the 28-day average at a major chokepoint → long the mapped shipping/oil names. Counts actual ships, not headlines — the most objective rule in the book.' },
+  'quake-country-etf': { family: 'event', title: 'Earthquake Fade', desc: 'M5.5+ earthquake in a country with a liquid single-country ETF → short that ETF for about a day. Bets on short-term local risk-off pressure.' },
+  'hurricane-energy': { family: 'event', title: 'Hurricane Energy', desc: 'Hurricane-strength Atlantic/East-Pacific storm → long natural gas and crude (UNG, USO). Bets on Gulf production and refining threats.' },
+  'global-risk-off': { family: 'event', title: 'Global Risk-Off', desc: 'Ten or more severe unrest events worldwide within 24 hours → long gold (GLD), watch volatility. A broad fear hedge for days when the whole map lights up.' },
+  'headline-risk': { family: 'event', title: 'Headline Risk', desc: 'High-threat news with importance ≥55 → watch-grade suggestions on the story’s tickers or sector proxies. Never auto-traded; informational only.' },
+  'ma-cross': { family: 'tech', title: 'EMA 5/20 Momentum', desc: 'The 5-day EMA crossing the 20-day EMA on a liquid ETF → trade in the direction of the cross. Classic short-term trend following: ride fresh momentum shifts for a day or two.' },
+  'rsi-reversal': { family: 'tech', title: 'RSI(2) Mean Reversion', desc: '2-period RSI under 10 → long the snap-back; over 90 → short. Connors-style: extreme short-term readings on index/sector ETFs tend to revert within 1–2 sessions.' },
+  'breakout-20': { family: 'tech', title: '20-Day Breakout', desc: 'Close beyond the prior 20-day high or low (Donchian channel) → trade the direction of the break. Range expansion tends to carry short-term follow-through.' },
+};
+
 // ---------------------------------------------------------------- autopilot
 // The engine does the trading: it prices every queued signal into a full plan
 // (entry, volatility-scaled stop, 2R target, risk-based size, time exit), then
@@ -509,6 +524,7 @@ const RULE_HORIZON_DAYS = {
   'quake-country-etf': 1, 'oil-producer-unrest': 2, 'chokepoint-disruption': 2,
   'hurricane-energy': 1.5, 'global-risk-off': 2, 'headline-risk': 1,
   'chokepoint-transit-drop': 2,
+  'ma-cross': 2, 'rsi-reversal': 1, 'breakout-20': 2,
 };
 
 // Exit-style variants — each auto trade is tagged (strategy rule × variant) so
@@ -662,6 +678,112 @@ async function autopilotTick() {
   } finally {
     autopilotRunning = false;
   }
+}
+
+// ---------------------------------------------------------------- technical strategies
+// Classic price-action rules scanned hourly over a fixed liquid ETF universe —
+// the control group against the event-driven strategies. Signals flow into the
+// same autopilot machinery (variants, sizing, per-strategy accounts).
+const TECH_UNIVERSE = ['SPY', 'QQQ', 'IWM', 'USO', 'XLE', 'GLD', 'SLV', 'UNG', 'TLT', 'FXI', 'EWT', 'ITA'];
+const barsCache = new Map(); // symbol -> { bars, fetchedAt }
+
+async function getDailyBars(symbol) {
+  const hit = barsCache.get(symbol);
+  if (hit && Date.now() - hit.fetchedAt < 30 * 60 * 1000) return hit.bars;
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=3mo`;
+  const data = await fetchJson(url, { Accept: 'application/json' });
+  const r = data?.chart?.result?.[0];
+  const q = r?.indicators?.quote?.[0];
+  if (!q?.close) throw new Error('no daily bars');
+  const bars = [];
+  for (let i = 0; i < q.close.length; i++) {
+    if ([q.open[i], q.high[i], q.low[i], q.close[i]].every(Number.isFinite)) {
+      bars.push({ ts: r.timestamp[i] * 1000, o: q.open[i], h: q.high[i], l: q.low[i], c: q.close[i] });
+    }
+  }
+  barsCache.set(symbol, { bars, fetchedAt: Date.now() });
+  return bars;
+}
+
+function emaSeries(values, period) {
+  const k = 2 / (period + 1);
+  const out = [values[0]];
+  for (let i = 1; i < values.length; i++) out.push(values[i] * k + out[i - 1] * (1 - k));
+  return out;
+}
+
+function rsiLast(closes, period = 2) {
+  if (closes.length <= period + 1) return null;
+  let avgG = 0, avgL = 0;
+  for (let i = 1; i <= period; i++) {
+    const d = closes[i] - closes[i - 1];
+    avgG += Math.max(d, 0);
+    avgL += Math.max(-d, 0);
+  }
+  avgG /= period; avgL /= period;
+  for (let i = period + 1; i < closes.length; i++) {
+    const d = closes[i] - closes[i - 1];
+    avgG = (avgG * (period - 1) + Math.max(d, 0)) / period;
+    avgL = (avgL * (period - 1) + Math.max(-d, 0)) / period;
+  }
+  return avgL === 0 ? 100 : 100 - 100 / (1 + avgG / avgL);
+}
+
+async function scanTechnicals() {
+  for (const sym of TECH_UNIVERSE) {
+    try {
+      const bars = await getDailyBars(sym);
+      if (bars.length < 30) continue;
+      const closes = bars.map((b) => b.c);
+      const n = closes.length - 1;
+      const last = closes[n];
+      const day = new Date(bars[n].ts).toISOString().slice(0, 10);
+
+      // 1. EMA 5/20 cross — fires only on a fresh cross.
+      const e5 = emaSeries(closes, 5);
+      const e20 = emaSeries(closes, 20);
+      const nowAbove = e5[n] > e20[n];
+      if (nowAbove !== (e5[n - 1] > e20[n - 1])) {
+        const dir = nowAbove ? 'long' : 'short';
+        makeSignal({
+          id: `ma-cross:${sym}:${day}`, rule: 'ma-cross',
+          headline: `${sym}: 5-day EMA crossed ${nowAbove ? 'above' : 'below'} 20-day`,
+          thesis: `Momentum shift on ${sym}: EMA5 ${e5[n].toFixed(2)} vs EMA20 ${e20[n].toFixed(2)}, price ${last.toFixed(2)}. Fresh cross — classic short-term trend entry ${dir}.`,
+          direction: dir, symbols: [sym], tvSymbol: sym, confidence: 'medium', event: null,
+        });
+      }
+
+      // 2. RSI(2) extremes — short-term mean reversion.
+      const r2 = rsiLast(closes, 2);
+      if (r2 != null && (r2 < 10 || r2 > 90)) {
+        const dir = r2 < 10 ? 'long' : 'short';
+        makeSignal({
+          id: `rsi-reversal:${sym}:${day}`, rule: 'rsi-reversal',
+          headline: `${sym}: RSI(2) at ${r2.toFixed(0)} — ${r2 < 10 ? 'oversold' : 'overbought'}`,
+          thesis: `2-period RSI on ${sym} is ${r2.toFixed(1)} at price ${last.toFixed(2)}. Extreme short-term readings tend to snap back within 1–2 sessions. Entry ${dir}.`,
+          direction: dir, symbols: [sym], tvSymbol: sym,
+          confidence: r2 < 5 || r2 > 95 ? 'medium' : 'low', event: null,
+        });
+      }
+
+      // 3. 20-day Donchian breakout.
+      const prior = bars.slice(-21, -1);
+      const hi = Math.max(...prior.map((b) => b.h));
+      const lo = Math.min(...prior.map((b) => b.l));
+      if (last > hi || last < lo) {
+        const dir = last > hi ? 'long' : 'short';
+        makeSignal({
+          id: `breakout-20:${sym}:${day}`, rule: 'breakout-20',
+          headline: `${sym}: 20-day ${last > hi ? 'high' : 'low'} break at ${last.toFixed(2)}`,
+          thesis: `${sym} closed at ${last.toFixed(2)}, beyond its prior 20-day ${last > hi ? `high of ${hi.toFixed(2)}` : `low of ${lo.toFixed(2)}`}. Range expansion tends to carry short-term follow-through. Entry ${dir}.`,
+          direction: dir, symbols: [sym], tvSymbol: sym, confidence: 'medium', event: null,
+        });
+      }
+    } catch (err) {
+      console.error(`[tech] ${sym}: ${err.message}`);
+    }
+  }
+  console.log('[tech] scan complete');
 }
 
 // ---------------------------------------------------------------- flights
@@ -911,6 +1033,7 @@ const MIME = {
 function serveStatic(res, urlPath) {
   let rel = urlPath === '/' ? 'index.html' : urlPath.replace(/^\/+/, '');
   if (rel === 'trades') rel = 'trades.html';
+  if (rel === 'strategies') rel = 'strategies.html';
   const file = path.normalize(path.join(PUBLIC_DIR, rel));
   if (!file.startsWith(PUBLIC_DIR)) { res.writeHead(403); res.end(); return; }
   fs.readFile(file, (err, buf) => {
@@ -1022,6 +1145,45 @@ const server = http.createServer(async (req, res) => {
         count: list.length,
         ships: list,
       });
+    }
+    if (p === '/api/strategy-accounts' && req.method === 'GET') {
+      // Each strategy presented as its own virtual $100k account: balance =
+      // base + its own realized P&L + unrealized on its open positions.
+      const VIRTUAL_BASE = 100000;
+      const auto = db.prepare('SELECT * FROM trades WHERE auto = 1 ORDER BY opened_at').all();
+      const openSymbols = [...new Set(auto.filter((t) => t.status === 'open').map((t) => t.symbol))];
+      const quotes = openSymbols.length ? await getQuotes(openSymbols) : {};
+      const accounts = [];
+      for (const [rule, meta] of Object.entries(STRATEGY_META)) {
+        const mine = auto.filter((t) => t.strategy === rule);
+        const closed = mine.filter((t) => t.status === 'closed').sort((a, b) => a.closed_at - b.closed_at);
+        const open = mine.filter((t) => t.status === 'open');
+        const firstTs = mine.length ? mine[0].opened_at : Date.now();
+        const curve = [{ ts: firstTs, balance: VIRTUAL_BASE }];
+        let bal = VIRTUAL_BASE;
+        for (const t of closed) {
+          bal += tradePnl(t) ?? 0;
+          curve.push({ ts: t.closed_at, balance: bal });
+        }
+        let unrealized = 0;
+        for (const t of open) {
+          const pnl = tradePnl(t, quotes[t.symbol]?.price);
+          if (pnl != null) unrealized += pnl;
+        }
+        curve.push({ ts: Date.now(), balance: bal + unrealized });
+        const wins = closed.filter((t) => (tradePnl(t) ?? 0) > 0).length;
+        accounts.push({
+          rule, family: meta.family, title: meta.title, description: meta.desc,
+          watchOnly: rule === 'headline-risk',
+          balance: bal + unrealized,
+          realized: bal - VIRTUAL_BASE, unrealized,
+          openCount: open.length, closedCount: closed.length,
+          winRate: closed.length ? wins / closed.length : null,
+          curve,
+        });
+      }
+      accounts.sort((a, b) => (a.watchOnly ? 1 : 0) - (b.watchOnly ? 1 : 0) || b.balance - a.balance);
+      return json(res, 200, { base: VIRTUAL_BASE, accounts });
     }
     if (p === '/api/chokepoints' && req.method === 'GET') {
       return json(res, 200, { fetchedAt: portwatchCache.fetchedAt, attribution: 'IMF PortWatch', chokepoints: portwatchCache.rows });
@@ -1152,5 +1314,7 @@ server.listen(PORT, () => {
   setInterval(() => autopilotTick(), 60 * 1000);
   refreshPortwatch().catch((e) => console.error('[portwatch] initial fetch failed:', e.message));
   setInterval(() => refreshPortwatch().catch((e) => console.error('[portwatch] refresh failed:', e.message)), 12 * 3600 * 1000);
+  scanTechnicals().catch((e) => console.error('[tech] initial scan failed:', e.message));
+  setInterval(() => scanTechnicals().catch((e) => console.error('[tech] scan failed:', e.message)), 60 * 60 * 1000);
   if (aisKey) startAisStream();
 });

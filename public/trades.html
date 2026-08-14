@@ -14,6 +14,7 @@
   <nav class="pages">
     <a href="/">Map</a>
     <a href="/trades" class="active">Trades</a>
+    <a href="/strategies">Strategies</a>
   </nav>
   <span class="status" id="status"></span>
   <button class="btn small" id="open-settings" title="API keys">⚙ Settings</button>
@@ -107,8 +108,14 @@
   </section>
 
   <section class="panel" id="activity-panel">
-    <h2>Autopilot activity</h2>
-    <div class="scroll" id="activity"></div>
+    <h2>Log
+      <span class="tabbtns">
+        <button id="tab-log" class="active">Trades</button>
+        <button id="tab-engine">Engine</button>
+      </span>
+    </h2>
+    <div class="scroll" id="tradelog"></div>
+    <div class="scroll" id="activity" hidden></div>
   </section>
 </main>
 <script type="module" src="/trades.js"></script>
