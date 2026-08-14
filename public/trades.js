@@ -84,8 +84,13 @@ document.getElementById('open-settings').addEventListener('click', async () => {
       input.value = '';
       input.placeholder = val || 'not set';
     }
+    document.getElementById('set-scalper').checked = Boolean(s.scalper);
   } catch { /* dialog still usable */ }
   settingsDlg.showModal();
+});
+document.getElementById('set-scalper').addEventListener('change', async (e) => {
+  await api('/api/settings', { method: 'POST', body: { scalper: e.target.checked } });
+  toast(`Crypto scalper ${e.target.checked ? 'enabled' : 'paused'}`);
 });
 document.getElementById('close-settings').addEventListener('click', () => settingsDlg.close());
 document.getElementById('save-settings').addEventListener('click', async () => {
@@ -296,9 +301,12 @@ document.querySelectorAll('#blotter-filters button').forEach((b) => b.addEventLi
   renderBlotter(lastTradesData);
 }));
 
+const BLOTTER_MAX_ROWS = 150;
 function renderBlotter(data) {
   lastTradesData = data;
-  const trades = data.trades.filter((t) => blotterFilter === 'all' || t.status === blotterFilter);
+  const all = data.trades.filter((t) => blotterFilter === 'all' || t.status === blotterFilter);
+  const trades = all.slice(0, BLOTTER_MAX_ROWS);
+  const truncated = all.length - trades.length;
   const box = document.getElementById('blotter');
   box.replaceChildren();
   if (!trades.length) {
@@ -341,15 +349,16 @@ function renderBlotter(data) {
         : null),
     ));
   }
-  const totalPnl = trades.reduce((s, t) => s + (t.pnl ?? 0), 0);
+  const totalPnl = all.reduce((s, t) => s + (t.pnl ?? 0), 0);
   tbody.append(el('tr', { class: 'blotter-total' },
-    el('td', { style: 'text-align:left' }, `Total (${trades.length})`),
+    el('td', { style: 'text-align:left' }, `Total (${all.length})`),
     ...Array.from({ length: 8 }, () => el('td')),
     pnlCell(totalPnl),
     el('td'), el('td'), el('td'), el('td'),
   ));
   table.append(tbody);
   box.append(table);
+  if (truncated > 0) box.append(el('div', { class: 'note' }, `Showing latest ${BLOTTER_MAX_ROWS} rows (${truncated} older hidden) — Export CSV has everything.`));
 }
 
 // ---- equity chart (performance tab) ----
@@ -486,7 +495,7 @@ function renderTradeLog(trades) {
     return;
   }
   events.sort((a, b) => b.ts - a.ts);
-  for (const ev of events) {
+  for (const ev of events.slice(0, 250)) {
     box.append(el('div', { class: `log-row ${ev.buy ? 'buy' : 'sell'}` },
       el('span', { class: 'log-arrow' }, ev.buy ? '▲' : '▼'),
       el('span', { class: 'log-main' },

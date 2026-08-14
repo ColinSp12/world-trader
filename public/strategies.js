@@ -58,6 +58,7 @@ function card(a, base) {
 const FAMILIES = [
   ['event', 'Event-driven — world data', 'Signals from worldmonitor.app events, news threat scores, and IMF PortWatch ship counts.'],
   ['tech', 'Technical — price action', 'Classic rules scanned hourly over 12 liquid ETFs: momentum, mean reversion, breakouts. The control group.'],
+  ['hyper', 'Day trading — hyperactive', 'Real-time crypto scalping, dozens to hundreds of round trips a day, fees baked into every fill.'],
 ];
 
 async function load() {

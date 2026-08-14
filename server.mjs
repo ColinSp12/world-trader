@@ -491,7 +491,9 @@ function closeTrade(t, exitPrice, reason) {
   db.prepare("UPDATE trades SET status = 'closed', closed_at = ?, exit_price = ?, exit_reason = ? WHERE id = ?")
     .run(Date.now(), exitPrice, reason, t.id);
   const pnl = tradePnl({ ...t, status: 'closed', exit_price: exitPrice });
-  logActivity('close', `Closed ${t.side} ${t.qty} ${t.symbol} @ ${exitPrice.toFixed(2)} — ${reason} (P&L ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)})`);
+  // Scalper fills log as 'scalp' so the toast layer (open/close only) stays quiet.
+  logActivity(t.strategy === SCALP_RULE ? 'scalp' : 'close',
+    `Closed ${t.side} ${t.qty} ${t.symbol} @ ${exitPrice.toFixed(2)} — ${reason} (P&L ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)})`);
   return pnl;
 }
 
@@ -508,6 +510,7 @@ const STRATEGY_META = {
   'ma-cross': { family: 'tech', title: 'EMA 5/20 Momentum', desc: 'The 5-day EMA crossing the 20-day EMA on a liquid ETF → trade in the direction of the cross. Classic short-term trend following: ride fresh momentum shifts for a day or two.' },
   'rsi-reversal': { family: 'tech', title: 'RSI(2) Mean Reversion', desc: '2-period RSI under 10 → long the snap-back; over 90 → short. Connors-style: extreme short-term readings on index/sector ETFs tend to revert within 1–2 sessions.' },
   'breakout-20': { family: 'tech', title: '20-Day Breakout', desc: 'Close beyond the prior 20-day high or low (Donchian channel) → trade the direction of the break. Range expansion tends to carry short-term follow-through.' },
+  'momo-scalper': { family: 'hyper', title: '1-Minute Momentum Scalper', desc: '24/7 crypto scalper on real-time Binance prices (BTC, ETH, SOL, XRP, DOGE, LTC): enters when 1-minute momentum exceeds ~6 bps, exits at +12 bps target / −9 bps stop / 5-minute time-out, $5k notional per position. A 2 bps per-side fee is baked into every fill — the honest scalping question is whether the edge beats costs. Executes dozens to hundreds of round trips a day.' },
 };
 
 // ---------------------------------------------------------------- autopilot
@@ -515,7 +518,8 @@ const STRATEGY_META = {
 // (entry, volatility-scaled stop, 2R target, risk-based size, time exit), then
 // opens and manages the paper positions itself. PAPER MONEY ONLY.
 let autopilotOn = getSetting('autopilot', '1') === '1';
-const MAX_OPEN_POSITIONS = 8;
+const MAX_OPEN_POSITIONS = 10; // event+tech book (scalper positions tracked separately)
+const SCALP_RULE = 'momo-scalper';
 const RISK_PER_TRADE = 0.01;         // 1% of equity at the stop
 const MAX_POSITION_FRACTION = 0.15;  // notional cap per position
 // Short-term regime: horizons of hours to 2 days, targets sized to be
@@ -623,12 +627,15 @@ async function autopilotTick() {
       const actionable = db.prepare(`SELECT * FROM signals WHERE status = 'new' AND plan_entry IS NOT NULL
         AND direction IN ('long','short') AND created_at > ? ORDER BY created_at DESC`).all(now - 24 * 3600 * 1000);
       for (const s of actionable) {
-        const openCount = db.prepare("SELECT COUNT(*) AS c FROM trades WHERE status = 'open'").get().c;
+        const openCount = db.prepare("SELECT COUNT(*) AS c FROM trades WHERE status = 'open' AND strategy != ?").get(SCALP_RULE).c;
         if (openCount >= MAX_OPEN_POSITIONS) { logActivity('skip', `Max ${MAX_OPEN_POSITIONS} open positions — ${s.tv_symbol} stays queued`); break; }
-        const dupe = db.prepare("SELECT COUNT(*) AS c FROM trades WHERE status = 'open' AND symbol = ?").get(s.tv_symbol).c;
+        // One position per symbol PER STRATEGY: each strategy runs its own
+        // virtual account, so e.g. breakout can be long SPY while RSI is
+        // short SPY — the accounts page compares them honestly.
+        const dupe = db.prepare("SELECT COUNT(*) AS c FROM trades WHERE status = 'open' AND symbol = ? AND strategy = ?").get(s.tv_symbol, s.rule).c;
         if (dupe) {
           db.prepare("UPDATE signals SET status = 'skipped' WHERE id = ?").run(s.id);
-          logActivity('skip', `Already holding ${s.tv_symbol} — skipped duplicate signal (${s.rule})`);
+          logActivity('skip', `${s.rule} already holds ${s.tv_symbol} — skipped duplicate signal`);
           continue;
         }
         try {
@@ -657,7 +664,8 @@ async function autopilotTick() {
       }
 
       // 3. Manage: stop / target / time exits on open positions.
-      const open = db.prepare("SELECT * FROM trades WHERE status = 'open'").all();
+      // The scalper manages its own book on real-time prices — excluded here.
+      const open = db.prepare("SELECT * FROM trades WHERE status = 'open' AND strategy != ?").all(SCALP_RULE);
       if (open.length) {
         const quotes = await getQuotes([...new Set(open.map((t) => t.symbol))]);
         for (const t of open) {
@@ -784,6 +792,84 @@ async function scanTechnicals() {
     }
   }
   console.log('[tech] scan complete');
+}
+
+// ---------------------------------------------------------------- hyper scalper
+// 24/7 crypto momentum scalper on real-time Binance prices — the hyperactive
+// day-trading account. Enters on short-burst momentum, exits at tight bps
+// targets/stops or a minutes-scale time-out. A per-side fee is baked into
+// every fill so the P&L answers the real scalping question: does the edge
+// beat costs? Runs its own book, independent of the signal-driven autopilot.
+const SCALP_PAIRS = {
+  'BTC-USD': 'BTCUSDT', 'ETH-USD': 'ETHUSDT', 'SOL-USD': 'SOLUSDT',
+  'XRP-USD': 'XRPUSDT', 'DOGE-USD': 'DOGEUSDT', 'LTC-USD': 'LTCUSDT',
+};
+const SCALP_TEST = process.env.SCALP_TEST === '1';
+const SCALP = {
+  tickMs: SCALP_TEST ? 5000 : 15000,
+  histLen: 24,
+  lookbackTicks: 4,                       // ~1 minute of momentum
+  enterBps: SCALP_TEST ? 0.5 : 6,
+  targetBps: 12,
+  stopBps: 9,
+  maxHoldMs: SCALP_TEST ? 45 * 1000 : 5 * 60 * 1000,
+  feeBps: 2,                              // per side, baked into fill prices
+  notional: 5000,                         // per position, virtual dollars
+};
+const scalpHist = new Map(); // symbol -> [{ts, price}]
+let scalperOn = getSetting('scalper', '1') === '1';
+let scalperRunning = false;
+
+async function scalperTick() {
+  if (!autopilotOn || !scalperOn || scalperRunning) return;
+  scalperRunning = true;
+  try {
+    const symsParam = encodeURIComponent(JSON.stringify(Object.values(SCALP_PAIRS)));
+    const data = await fetchJson(`https://api.binance.com/api/v3/ticker/price?symbols=${symsParam}`);
+    const prices = new Map(data.map((d) => [d.symbol, parseFloat(d.price)]));
+    const now = Date.now();
+
+    for (const [sym, pair] of Object.entries(SCALP_PAIRS)) {
+      const px = prices.get(pair);
+      if (!Number.isFinite(px)) continue;
+      const hist = scalpHist.get(sym) || [];
+      hist.push({ ts: now, price: px });
+      while (hist.length > SCALP.histLen) hist.shift();
+      scalpHist.set(sym, hist);
+
+      const open = db.prepare("SELECT * FROM trades WHERE status = 'open' AND symbol = ? AND strategy = ?").get(sym, SCALP_RULE);
+      if (open) {
+        const dir = open.side === 'long' ? 1 : -1;
+        const exitFill = px * (1 - dir * SCALP.feeBps / 10000);
+        const movedBps = ((exitFill - open.entry_price) / open.entry_price) * 10000 * dir;
+        let reason = null;
+        if (movedBps >= SCALP.targetBps) reason = 'scalp target';
+        else if (movedBps <= -SCALP.stopBps) reason = 'scalp stop';
+        else if (now - open.opened_at >= SCALP.maxHoldMs) reason = 'scalp time';
+        if (reason) closeTrade(open, exitFill, reason);
+        continue;
+      }
+
+      if (hist.length <= SCALP.lookbackTicks) continue;
+      const back = hist[hist.length - 1 - SCALP.lookbackTicks];
+      const momBps = ((px - back.price) / back.price) * 10000;
+      if (Math.abs(momBps) < SCALP.enterBps) continue;
+      const side = momBps > 0 ? 'long' : 'short';
+      const dir = side === 'long' ? 1 : -1;
+      const fill = px * (1 + dir * SCALP.feeBps / 10000); // adverse fee on entry
+      const qty = +(SCALP.notional / fill).toFixed(6);
+      db.prepare(`INSERT INTO trades (opened_at, symbol, side, qty, entry_price, stop_price, target_price, expires_at, auto, signal_id, thesis, strategy, variant)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?, 'scalp')`)
+        .run(now, sym, side, qty, fill,
+          fill * (1 - dir * SCALP.stopBps / 10000),
+          fill * (1 + dir * SCALP.targetBps / 10000),
+          now + SCALP.maxHoldMs,
+          `1-min momentum ${momBps.toFixed(1)} bps`, SCALP_RULE);
+      logActivity('scalp', `SCALP ${side} ${qty} ${sym} @ ${fill.toFixed(2)} (momentum ${momBps > 0 ? '+' : ''}${momBps.toFixed(1)} bps)`);
+    }
+  } catch { /* transient price failure — next tick retries */ } finally {
+    scalperRunning = false;
+  }
 }
 
 // ---------------------------------------------------------------- flights
@@ -1171,6 +1257,14 @@ const server = http.createServer(async (req, res) => {
           if (pnl != null) unrealized += pnl;
         }
         curve.push({ ts: Date.now(), balance: bal + unrealized });
+        // Hyperactive strategies produce thousands of curve points — downsample.
+        if (curve.length > 400) {
+          const step = Math.ceil(curve.length / 400);
+          const sampled = curve.filter((_, i) => i % step === 0);
+          if (sampled[sampled.length - 1] !== curve[curve.length - 1]) sampled.push(curve[curve.length - 1]);
+          curve.length = 0;
+          curve.push(...sampled);
+        }
         const wins = closed.filter((t) => (tradePnl(t) ?? 0) > 0).length;
         accounts.push({
           rule, family: meta.family, title: meta.title, description: meta.desc,
@@ -1190,7 +1284,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (p === '/api/settings' && req.method === 'GET') {
       const mask = (k) => (k ? `••••••••${k.slice(-4)}` : '');
-      return json(res, 200, { aisstream_key: mask(aisKey), wm_api_key: mask(wmKey) });
+      return json(res, 200, { aisstream_key: mask(aisKey), wm_api_key: mask(wmKey), scalper: scalperOn });
     }
     if (p === '/api/settings' && req.method === 'POST') {
       const b = await readBody(req);
@@ -1208,6 +1302,11 @@ const server = http.createServer(async (req, res) => {
         stopAisStream();
         ships.clear();
         logActivity('info', 'aisstream.io key removed — ships back to Baltic demo feed');
+      }
+      if (typeof b.scalper === 'boolean') {
+        scalperOn = b.scalper;
+        setSetting('scalper', scalperOn ? '1' : '0');
+        logActivity('info', `Scalper ${scalperOn ? 'ENABLED' : 'PAUSED'} by user`);
       }
       if (typeof b.wm_api_key === 'string' && b.wm_api_key.trim()) {
         wmKey = b.wm_api_key.trim();
@@ -1316,5 +1415,7 @@ server.listen(PORT, () => {
   setInterval(() => refreshPortwatch().catch((e) => console.error('[portwatch] refresh failed:', e.message)), 12 * 3600 * 1000);
   scanTechnicals().catch((e) => console.error('[tech] initial scan failed:', e.message));
   setInterval(() => scanTechnicals().catch((e) => console.error('[tech] scan failed:', e.message)), 60 * 60 * 1000);
+  setInterval(() => scalperTick(), SCALP.tickMs);
+  console.log(`[scalper] ${scalperOn ? 'active' : 'paused'} — ${Object.keys(SCALP_PAIRS).length} pairs, tick ${SCALP.tickMs / 1000}s${SCALP_TEST ? ' (TEST MODE)' : ''}`);
   if (aisKey) startAisStream();
 });
