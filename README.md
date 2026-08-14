@@ -97,6 +97,7 @@ Transparent heuristics, deduped per situation per day, stored in SQLite:
 | `hurricane-energy` | hurricane-strength Atlantic/EP storm | long UNG / USO, watch insurers |
 | `global-risk-off` | ≥10 severe unrest events in 24h | long GLD, watch VIXY |
 | `headline-risk` | high-threat news, importance ≥55 | watch the story's tickers or sector proxies |
+| `chokepoint-transit-drop` | IMF PortWatch daily transits ≥30% below 28-day avg | long shipping/oil per chokepoint |
 
 Edit the rules in `server.mjs` — they are ~80 lines of plain JS and meant to be
 tinkered with.

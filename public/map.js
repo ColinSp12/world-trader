@@ -96,16 +96,49 @@ const CHOKEPOINTS = [
   { name: 'Strait of Gibraltar', lat: 35.95, lon: -5.6, note: 'Mediterranean gate', syms: null },
   { name: 'Dover Strait', lat: 51.0, lon: 1.4, note: 'world’s busiest shipping lane', syms: null },
 ];
-for (const c of CHOKEPOINTS) {
-  L.marker([c.lat, c.lon], {
-    icon: L.divIcon({ className: 'choke-icon', html: '◆', iconSize: [14, 14], iconAnchor: [7, 7] }),
-    keyboard: false,
-  }).bindPopup(el('div', {},
+const PW_IDS = {
+  'Strait of Hormuz': 'chokepoint6', 'Suez Canal': 'chokepoint1', 'Bab el-Mandeb': 'chokepoint4',
+  'Strait of Malacca': 'chokepoint5', 'Panama Canal': 'chokepoint2', 'Bosporus': 'chokepoint3',
+  'Taiwan Strait': 'chokepoint11', 'Strait of Gibraltar': 'chokepoint8', 'Dover Strait': 'chokepoint9',
+};
+const chokeMarkers = new Map();
+
+function chokePopup(c, stats) {
+  const wrap = el('div', {},
     el('div', { style: 'font-weight:600' }, `◆ ${c.name}`),
     el('div', { class: 'm' }, `shipping chokepoint · ${c.note}`),
-    c.syms ? el('div', { class: 'm' }, `watch on disruption: ${c.syms}`) : null,
-  )).addTo(map);
+  );
+  if (stats && stats.ratio != null) {
+    const pct = Math.round((stats.ratio - 1) * 100);
+    wrap.append(el('div', {
+      class: 'm',
+      style: stats.ratio < 0.7 ? 'color: var(--down); font-weight: 600' : '',
+    }, `${stats.transits} transits ${new Date(stats.date).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })} · ${pct >= 0 ? '+' : ''}${pct}% vs 28-day avg`));
+  }
+  if (c.syms) wrap.append(el('div', { class: 'm' }, `watch on disruption: ${c.syms}`));
+  if (stats) wrap.append(el('div', { class: 'm' }, 'transit data: IMF PortWatch'));
+  return wrap;
 }
+
+for (const c of CHOKEPOINTS) {
+  const marker = L.marker([c.lat, c.lon], {
+    icon: L.divIcon({ className: 'choke-icon', html: '◆', iconSize: [14, 14], iconAnchor: [7, 7] }),
+    keyboard: false,
+  }).bindPopup(chokePopup(c, null)).addTo(map);
+  if (PW_IDS[c.name]) chokeMarkers.set(PW_IDS[c.name], { marker, info: c });
+}
+
+async function refreshChokepoints() {
+  try {
+    const d = await api('/api/chokepoints');
+    for (const stats of d.chokepoints) {
+      const entry = chokeMarkers.get(stats.id);
+      if (entry) entry.marker.setPopupContent(chokePopup(entry.info, stats));
+    }
+  } catch { /* popups keep static content */ }
+}
+refreshChokepoints();
+setInterval(refreshChokepoints, 60 * 60 * 1000);
 
 const markerLayer = L.layerGroup().addTo(map);
 const markerById = new Map();

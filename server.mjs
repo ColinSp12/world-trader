@@ -508,6 +508,7 @@ const MAX_POSITION_FRACTION = 0.15;  // notional cap per position
 const RULE_HORIZON_DAYS = {
   'quake-country-etf': 1, 'oil-producer-unrest': 2, 'chokepoint-disruption': 2,
   'hurricane-energy': 1.5, 'global-risk-off': 2, 'headline-risk': 1,
+  'chokepoint-transit-drop': 2,
 };
 
 // Exit-style variants — each auto trade is tagged (strategy rule × variant) so
@@ -816,6 +817,69 @@ function startAisStream() {
   connect();
 }
 
+// ---------------------------------------------------------------- chokepoint transits (IMF PortWatch)
+// Zero-auth open data: daily transit calls per chokepoint, satellite-AIS based,
+// updated weekly with a few days' lag. A collapse in transits vs the trailing
+// average is a real disruption indicator. Attribution: IMF PortWatch.
+const PW_BASE = 'https://services9.arcgis.com/weJ1QsnbMYJlCHdG/arcgis/rest/services/Daily_Chokepoints_Data/FeatureServer/0/query';
+const PW_CHOKEPOINTS = {
+  chokepoint1: { name: 'Suez Canal', symbols: ['FRO', 'ZIM', 'USO'] },
+  chokepoint2: { name: 'Panama Canal', symbols: ['ZIM'] },
+  chokepoint3: { name: 'Bosporus', symbols: ['WEAT', 'USO'] },
+  chokepoint4: { name: 'Bab el-Mandeb', symbols: ['FRO', 'USO'] },
+  chokepoint5: { name: 'Malacca Strait', symbols: ['FXI', 'EWS'] },
+  chokepoint6: { name: 'Strait of Hormuz', symbols: ['USO', 'XLE'] },
+  chokepoint8: { name: 'Gibraltar Strait', symbols: ['ZIM'] },
+  chokepoint9: { name: 'Dover Strait', symbols: ['ZIM'] },
+  chokepoint11: { name: 'Taiwan Strait', symbols: ['EWT', 'SMH'] },
+};
+const portwatchCache = { rows: [], fetchedAt: 0 };
+
+async function refreshPortwatch() {
+  const rows = [];
+  for (const [id, info] of Object.entries(PW_CHOKEPOINTS)) {
+    try {
+      const url = `${PW_BASE}?where=portid%3D%27${id}%27&outFields=date,n_total,capacity&orderByFields=date%20DESC&resultRecordCount=33&f=json`;
+      const d = await fetchJson(url);
+      const rowsRaw = (d.features || []).map((f) => f.attributes).filter((a) => Number.isFinite(a.n_total));
+      if (rowsRaw.length < 10) continue;
+      const [latest, ...rest] = rowsRaw;
+      const win = rest.slice(0, 28);
+      const avg28 = win.reduce((s, a) => s + a.n_total, 0) / win.length;
+      rows.push({
+        id, name: info.name, symbols: info.symbols,
+        date: latest.date, transits: latest.n_total, dwt: latest.capacity,
+        avg28, ratio: avg28 > 0 ? latest.n_total / avg28 : null,
+      });
+    } catch (err) {
+      console.error(`[portwatch] ${id} failed: ${err.message}`);
+    }
+  }
+  if (rows.length) {
+    portwatchCache.rows = rows;
+    portwatchCache.fetchedAt = Date.now();
+    try { deriveChokepointSignals(rows); } catch (err) { console.error('[portwatch] signals:', err.message); }
+  }
+  console.log(`[portwatch] ${rows.length} chokepoints refreshed`);
+}
+
+function deriveChokepointSignals(rows) {
+  for (const r of rows) {
+    if (r.ratio == null || r.avg28 < 5 || r.ratio > 0.7) continue;
+    const day = new Date(r.date).toISOString().slice(0, 10);
+    const pct = Math.round((1 - r.ratio) * 100);
+    makeSignal({
+      id: `cptransit:${r.id}:${day}`,
+      rule: 'chokepoint-transit-drop',
+      headline: `${r.name} transits down ${pct}% vs 28-day average`,
+      thesis: `IMF PortWatch daily data: ${r.transits} transit calls on ${day} vs a 28-day average of ${r.avg28.toFixed(1)} (−${pct}%). Sustained drops at this chokepoint mean rerouting, longer voyages, and tighter effective supply. Hypothesis: long ${r.symbols.join(', ')}.`,
+      direction: 'long', symbols: r.symbols, tvSymbol: r.symbols[0],
+      confidence: r.ratio <= 0.5 ? 'high' : 'medium',
+      event: { title: `${r.name} transit drop`, url: 'https://portwatch.imf.org', kind: 'chokepoint' },
+    });
+  }
+}
+
 // ---------------------------------------------------------------- equity history
 const SNAPSHOT_INTERVAL_MS = 10 * 60 * 1000;
 
@@ -959,6 +1023,9 @@ const server = http.createServer(async (req, res) => {
         ships: list,
       });
     }
+    if (p === '/api/chokepoints' && req.method === 'GET') {
+      return json(res, 200, { fetchedAt: portwatchCache.fetchedAt, attribution: 'IMF PortWatch', chokepoints: portwatchCache.rows });
+    }
     if (p === '/api/settings' && req.method === 'GET') {
       const mask = (k) => (k ? `••••••••${k.slice(-4)}` : '');
       return json(res, 200, { aisstream_key: mask(aisKey), wm_api_key: mask(wmKey) });
@@ -1083,5 +1150,7 @@ server.listen(PORT, () => {
     .catch((e) => console.error('[events] initial refresh failed:', e.message));
   setInterval(() => refreshEvents().catch((e) => console.error('[events] refresh failed:', e.message)), EVENT_REFRESH_MS);
   setInterval(() => autopilotTick(), 60 * 1000);
+  refreshPortwatch().catch((e) => console.error('[portwatch] initial fetch failed:', e.message));
+  setInterval(() => refreshPortwatch().catch((e) => console.error('[portwatch] refresh failed:', e.message)), 12 * 3600 * 1000);
   if (aisKey) startAisStream();
 });
