@@ -144,6 +144,7 @@ const FAMILIES = [
   ['event', 'Event-driven — world data', 'Signals from worldmonitor.app events, news threat scores, and IMF PortWatch ship counts.'],
   ['tech', 'Technical — price action', 'Classic rules scanned hourly over 12 liquid ETFs: momentum, mean reversion, breakouts. The control group.'],
   ['day', 'Day trading — intraday', 'Opening-range breakouts, gap fades, VWAP reversion on liquid US names, and a London-session FX account. Always flat before the session ends.'],
+  ['sector', 'Sector — news investing', 'Regular-investing accounts that trade only their sector: good news → buy and hold about a week, bad news → sell the position. AI/chips vs software, head to head.'],
   ['hyper', 'Scalping — hyperactive', 'Real-time crypto scalping at true taker costs, parameters evolving in generations.'],
 ];
 

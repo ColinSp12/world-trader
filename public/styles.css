@@ -1,4 +1,4 @@
-/* world-trader — dark-only trading sandbox UI. Tokens from validated dark palette. */
+﻿/* world-trader â€” dark-only trading sandbox UI. Tokens from validated dark palette. */
 :root {
   color-scheme: dark;
   --page: #0d0d0d;
@@ -9,9 +9,9 @@
   --muted: #898781;
   --hairline: rgba(255, 255, 255, 0.10);
   --grid: #2c2c2a;
-  --accent: #3987e5;      /* categorical slot 1 (dark) — quakes, links, focus */
-  --cat-unrest: #d95926;  /* slot 2 — unrest + conflict */
-  --cat-natural: #199e70; /* slot 3 — natural events */
+  --accent: #3987e5;      /* categorical slot 1 (dark) â€” quakes, links, focus */
+  --cat-unrest: #d95926;  /* slot 2 â€” unrest + conflict */
+  --cat-natural: #199e70; /* slot 3 â€” natural events */
   --up: #0ca30c;          /* delta good (dark) */
   --down: #d03b3b;        /* status critical */
   --warn: #fab219;
@@ -653,3 +653,7 @@ main.backtest {
 /* ---- day-trading strategy family (gold) ---- */
 .fam-dot.fam-day { background: #d0a215; }
 .fam-border-day { border-left: 3px solid #d0a215; }
+
+/* ---- sector news-investing family (green) ---- */
+.fam-sector { background: #199e70; }
+.fam-border-sector { border-left: 3px solid #199e70; }

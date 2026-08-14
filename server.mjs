@@ -247,6 +247,8 @@ const SPREAD_BPS = {
   PAK: 15, THD: 6, EWM: 6, EPU: 10, GXG: 12, URA: 4, LMT: 2, PANW: 2, BUG: 6, SMH: 2,
   AAPL: 1, NVDA: 2, TSLA: 3,
   'EURUSD=X': 1, 'GBPUSD=X': 1.5, 'AUDUSD=X': 1.5, // retail FX majors: ~1 pip
+  AMD: 2, AVGO: 2, TSM: 2, MU: 2, MRVL: 3, INTC: 2, SMCI: 5, PLTR: 2, MSFT: 1, GOOGL: 1, META: 1,
+  CRM: 2, NOW: 2, ADBE: 2, ORCL: 2, SNOW: 3, DDOG: 3, CRWD: 2, ZS: 3, MDB: 4, TEAM: 3, INTU: 2, SHOP: 2, IGV: 3,
 };
 const SLIPPAGE_BPS = 2;
 const frictionBps = (sym) => (SPREAD_BPS[sym] ?? 12) / 2 + SLIPPAGE_BPS;
@@ -400,6 +402,7 @@ async function refreshEvents() {
   eventCache.errors = errors;
   try { deriveSignals(valid); } catch (err) { errors.push(`signals: ${err.message}`); }
   try { deriveNewsSignals(news); } catch (err) { errors.push(`news-signals: ${err.message}`); }
+  try { await deriveSectorNews(news); } catch (err) { errors.push(`sector-news: ${err.message}`); }
   console.log(`[events] ${valid.length} events, ${news.length} news items (${errors.length ? 'errors: ' + errors.join('; ') : 'ok'})`);
 }
 
@@ -475,6 +478,105 @@ function deriveNewsSignals(items) {
     // INSERT OR IGNORE: only count rows actually inserted, or already-seen
     // headlines burn the whole per-refresh budget and starve new ones.
     if (Number(info.changes) > 0) made++;
+  }
+}
+
+// ---------------------------------------------------------------- sector news investing
+// "Regular investing" strategies that trade ONLY their sector: good news on a
+// covered name → buy and hold for about a week; bad news → sell whatever the
+// strategy holds in that name. Long-only, transparent keyword sentiment.
+const SECTOR_RULES = {
+  'ai-news': {
+    tickers: {
+      NVDA: ['nvidia'], AMD: ['\\bamd\\b', 'advanced micro devices'], AVGO: ['broadcom'],
+      TSM: ['\\btsmc\\b', 'taiwan semiconductor'], MU: ['micron'], MRVL: ['marvell'],
+      INTC: ['intel'], SMCI: ['super micro', 'supermicro'], PLTR: ['palantir'],
+      MSFT: ['microsoft', 'openai'], GOOGL: ['google', 'alphabet', 'deepmind'],
+      META: ['meta platforms', "meta's ai", 'meta ai'],
+    },
+  },
+  'software-news': {
+    tickers: {
+      CRM: ['salesforce'], NOW: ['servicenow'], ADBE: ['adobe'], ORCL: ['oracle'],
+      SNOW: ['snowflake'], DDOG: ['datadog'], CRWD: ['crowdstrike'], PANW: ['palo alto networks'],
+      ZS: ['zscaler'], MDB: ['mongodb'], TEAM: ['atlassian'], INTU: ['intuit'], SHOP: ['shopify'],
+    },
+  },
+};
+// Precompiled name matchers (ticker arrays in the digest are the primary key;
+// company names in the headline are the fallback). Both ends get a word
+// boundary — 'intel' must never match 'intelligence'.
+const bounded = (k) => (k.startsWith('\\b') ? k : `\\b${k}\\b`);
+const SECTOR_MATCHERS = {};
+for (const [rule, cfg] of Object.entries(SECTOR_RULES)) {
+  SECTOR_MATCHERS[rule] = Object.fromEntries(Object.entries(cfg.tickers)
+    .map(([sym, kws]) => [sym, new RegExp(kws.map(bounded).join('|'), 'i')]));
+}
+// Sentiment lexicons as word-boundary regexes — plain substring matching let
+// 'ban' hit 'banditry' and 'hack' hit 'hackathon'.
+const POS_RE = ['beats', 'beat estimates', 'tops estimates', 'record revenue', 'record profit', 'surge[sd]?',
+  'soar(s|ed|ing)?', 'jump(s|ed)?', 'rall(y|ies|ied)', 'upgrade[sd]?', 'raise[sd]? guidance',
+  'strong demand', 'strong growth', 'wins', 'contract win', 'partnership', 'expand(s|ing)?',
+  'breakthrough', 'unveil(s|ed)?', 'accelerat(es|ing|ed)?', 'outperform(s|ed)?', 'buyback',
+  'profit rises', 'revenue rises', 'better.than.expected', 'all.time high'].map((w) => new RegExp(`\\b${w}\\b`, 'i'));
+const NEG_RE = ['misses', 'miss(ed)? estimates', 'falls short', 'plunge[sd]?', 'sink(s|ing)?', 'slump(s|ed)?',
+  'tumble[sd]?', 'downgrade[sd]?', 'cut(s|ting)? guidance', 'lower(s|ed) guidance', 'warn(s|ed|ing)?',
+  'lawsuit', 'probe[sd]?', 'investigation', 'layoff(s)?', 'recall(s|ed)?', 'breach(es|ed)?', 'hack(s|ed)?',
+  'outage[s]?', 'delay(s|ed)?', 'halt(s|ed)?', 'ban(s|ned)?', 'restriction(s)?', 'antitrust',
+  'weak demand', 'slowdown', 'decline[sd]?', 'loss widens', 'worse.than.expected'].map((w) => new RegExp(`\\b${w}\\b`, 'i'));
+function sentimentScore(text) {
+  let s = 0;
+  for (const re of POS_RE) if (re.test(text)) s++;
+  for (const re of NEG_RE) if (re.test(text)) s--;
+  return s;
+}
+
+async function deriveSectorNews(items) {
+  const now = Date.now();
+  for (const n of items) {
+    if (!n.ts || now - n.ts > 24 * 3600 * 1000) continue;
+    if ((n.importance || 0) < 35) continue;
+    const text = `${n.title} ${n.snippet || ''}`;
+    const lower = text.toLowerCase();
+    const senti = sentimentScore(lower);
+    if (senti === 0) continue;
+    for (const [rule, matchers] of Object.entries(SECTOR_MATCHERS)) {
+      for (const [sym, re] of Object.entries(matchers)) {
+        const mentioned = (n.tickers || []).includes(sym) || re.test(text);
+        if (!mentioned) continue;
+        if (senti >= 1) {
+          // Good news → buy. One position per name per 3 days keeps a story
+          // that runs for a week from stacking duplicate buys.
+          makeSignal({
+            id: `${rule}:${sym}:${Math.floor(now / (3 * 86400000))}`, rule,
+            headline: `${sym}: good news — ${n.title.slice(0, 80)}`,
+            thesis: `${(n.snippet || n.title).slice(0, 220)} (${n.source}; importance ${n.importance}). Positive coverage on a covered ${rule === 'ai-news' ? 'AI/chip' : 'software'} name — buy and hold for about a week, or sell earlier if the news turns.`,
+            direction: 'long', symbols: [sym], tvSymbol: sym,
+            confidence: n.importance >= 65 ? 'high' : n.importance >= 45 ? 'medium' : 'low',
+            event: { title: n.title, url: n.url, kind: 'news' },
+          });
+        } else {
+          // Bad news → sell whatever this strategy holds in the name.
+          const open = db.prepare("SELECT * FROM trades WHERE status = 'open' AND symbol = ? AND strategy = ? AND side = 'long'").get(sym, rule);
+          if (!open) continue;
+          if (marketOpenFor(sym, now)) {
+            try {
+              const q = await getQuote(sym);
+              if (Number.isFinite(q.price) && !q.stale) {
+                const fill = applyFriction(sym, 'long', q.price, false);
+                if (closeTrade(open, fill, 'news exit', Math.abs(fill - q.price) * open.qty) != null) {
+                  logActivity('info', `Sold ${sym} (${rule}) on negative coverage — ${n.title.slice(0, 90)}`);
+                }
+              }
+            } catch { /* manage loop exits it next tick */ }
+          } else {
+            // Market closed: flag for exit at the next session's fresh quote.
+            db.prepare("UPDATE trades SET expires_at = ? WHERE id = ? AND status = 'open'").run(now, open.id);
+            logActivity('info', `Negative news on ${sym} (${rule}) — will sell at the next open: ${n.title.slice(0, 90)}`);
+          }
+        }
+      }
+    }
   }
 }
 
@@ -704,6 +806,8 @@ const STRATEGY_META = {
   'ma-cross': { family: 'tech', title: 'EMA 5/20 Momentum', desc: 'The 5-day EMA crossing the 20-day EMA on a liquid ETF → trade in the direction of the cross. Classic short-term trend following: ride fresh momentum shifts for a day or two.' },
   'rsi-reversal': { family: 'tech', title: 'RSI(2) Mean Reversion', desc: '2-period RSI under 10 → long the snap-back; over 90 → short. Connors-style: extreme short-term readings on index/sector ETFs tend to revert within 1–2 sessions.' },
   'breakout-20': { family: 'tech', title: '20-Day Breakout', desc: 'Close beyond the prior 20-day high or low (Donchian channel) → trade the direction of the break. Range expansion tends to carry short-term follow-through.' },
+  'ai-news': { family: 'sector', title: 'AI & Chips — News Investor', desc: 'Trades ONLY the AI complex: NVDA, AMD, AVGO, TSM, MU, MRVL, INTC, SMCI, PLTR, MSFT, GOOGL, META. Regular-investing style: positive coverage (beats, upgrades, big wins) → buy and hold for about a week with an ADR-scaled stop; negative coverage (misses, downgrades, probes) → sell whatever it holds in that name. Long-only, transparent keyword sentiment on the WorldMonitor news digest.' },
+  'software-news': { family: 'sector', title: 'Software — News Investor', desc: 'Same news-investor playbook, restricted to software: CRM, NOW, ADBE, ORCL, SNOW, DDOG, CRWD, PANW, ZS, MDB, TEAM, INTU, SHOP. Good news → buy and hold about a week; bad news → sell the position. Head-to-head with the AI account, it answers which sector’s headlines are actually worth trading.' },
   'orb-15min': { family: 'day', title: '15-Min Opening Range Breakout', desc: 'Records the high and low of the first 15 minutes after the US open, then trades the first clean break of that range — long above the high, short below the low — with the stop at the range midpoint and the target at 1.5× the range beyond the break. Always flat before the close. The classic day-trading setup, run on SPY, QQQ, IWM, AAPL, NVDA, TSLA.' },
   'gap-fade': { family: 'day', title: 'Overnight Gap Fade', desc: 'When a symbol opens 0.4–3% away from yesterday’s close and is still stretched mid-morning, fade the gap back toward the prior close (short a gap-up, long a gap-down). Target = yesterday’s close (the fill), stop at 60% of the gap beyond entry, flat by the close. Bets on the well-documented tendency of moderate gaps to fill.' },
   'vwap-revert': { family: 'day', title: 'VWAP Reversion', desc: 'Volume-weighted average price is the institutional anchor of the session. When price stretches far from VWAP (threshold scaled to each symbol’s volatility), fade back toward it — target at VWAP, stop at 60% of the stretch beyond entry, flat by the close.' },
@@ -730,6 +834,7 @@ const RULE_HORIZON_DAYS = {
   'chokepoint-transit-drop': 2,
   'ma-cross': 2, 'rsi-reversal': 1, 'breakout-20': 2,
   'orb-15min': 0.3, 'gap-fade': 0.3, 'vwap-revert': 0.3, 'fx-session': 0.3,
+  'ai-news': 7, 'software-news': 7, // "regular investing" — week-scale holds
 };
 
 // Intraday rules: they carry their own levels (set at signal creation), enter

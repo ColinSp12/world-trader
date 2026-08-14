@@ -73,6 +73,7 @@ export const RULE_FAMILY = {
   'quake-country-etf': 'event', 'hurricane-energy': 'event', 'global-risk-off': 'event', 'headline-risk': 'event',
   'ma-cross': 'tech', 'rsi-reversal': 'tech', 'breakout-20': 'tech',
   'orb-15min': 'day', 'gap-fade': 'day', 'vwap-revert': 'day', 'fx-session': 'day',
+  'ai-news': 'sector', 'software-news': 'sector',
   'momo-scalper': 'hyper',
 };
 export function famDot(strategy) {

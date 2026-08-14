@@ -168,6 +168,17 @@ A third, **day-trading family** works intraday on delayed 5-minute bars
 | `vwap-revert` | price stretched from session VWAP (volatility-scaled) | fade back to the institutional anchor |
 | `fx-session` | break of London's first-hour range on EUR/GBP/AUD vs USD | session momentum on a non-US market, flat before NY lunch |
 
+A fourth, **sector news-investing family** trades only its own sector,
+regular-investing style — positive coverage (beats, upgrades, contract wins)
+→ buy and hold about a week with an ADR-scaled stop; negative coverage
+(misses, downgrades, probes) → sell the position. Long-only, transparent
+keyword sentiment on the WorldMonitor digest:
+
+| Rule | Universe |
+|---|---|
+| `ai-news` | NVDA, AMD, AVGO, TSM, MU, MRVL, INTC, SMCI, PLTR, MSFT, GOOGL, META |
+| `software-news` | CRM, NOW, ADBE, ORCL, SNOW, DDOG, CRWD, PANW, ZS, MDB, TEAM, INTU, SHOP |
+
 And the **hyperactive family**: `momo-scalper`, a 24/7 crypto momentum scalper
 on real-time Binance prices whose parameters evolve in generations under real
 taker costs.
