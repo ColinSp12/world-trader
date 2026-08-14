@@ -1,4 +1,4 @@
-import { el, api, timeAgo, fmtPnl, fmtPrice, safeUrl } from '/shared.js';
+import { el, api, timeAgo, fmtPnl, fmtPrice, safeUrl, renderTradeLogList } from '/shared.js';
 
 let currentSymbol = 'USO';
 let signalsCache = [];
@@ -469,45 +469,7 @@ function showLogTab(which) {
 }
 
 function renderTradeLog(trades) {
-  const box = document.getElementById('tradelog');
-  box.replaceChildren();
-  const events = [];
-  for (const t of trades) {
-    events.push({
-      ts: t.opened_at,
-      buy: t.side === 'long',
-      label: `${t.side === 'long' ? 'BUY' : 'SELL SHORT'} ${t.qty} ${t.symbol} @ ${fmtPrice(t.entry_price)}`,
-      tag: t.auto ? `${t.strategy || ''}` : 'manual',
-    });
-    if (t.status === 'closed') {
-      const pct = t.entry_price * t.qty ? (t.pnl / (t.entry_price * t.qty)) * 100 : null;
-      events.push({
-        ts: t.closed_at,
-        buy: t.side !== 'long',
-        label: `${t.side === 'long' ? 'SELL' : 'BUY TO COVER'} ${t.qty} ${t.symbol} @ ${fmtPrice(t.exit_price)}`,
-        pnl: t.pnl, pct,
-        tag: t.exit_reason || 'closed',
-      });
-    }
-  }
-  if (!events.length) {
-    box.append(el('div', { class: 'empty' }, 'Trade fills appear here — green for buys, red for sells, with profit on every exit.'));
-    return;
-  }
-  events.sort((a, b) => b.ts - a.ts);
-  for (const ev of events.slice(0, 250)) {
-    box.append(el('div', { class: `log-row ${ev.buy ? 'buy' : 'sell'}` },
-      el('span', { class: 'log-arrow' }, ev.buy ? '▲' : '▼'),
-      el('span', { class: 'log-main' },
-        el('span', { class: 'log-label' }, ev.label),
-        ev.pnl != null
-          ? el('span', { class: `log-pnl ${ev.pnl >= 0 ? 'pnl-up' : 'pnl-down'}` },
-              `${fmtPnl(ev.pnl)}${Number.isFinite(ev.pct) ? ` (${ev.pct >= 0 ? '+' : ''}${ev.pct.toFixed(2)}%)` : ''}`)
-          : null,
-        el('span', { class: 'log-meta' }, `${ev.tag} · ${timeAgo(ev.ts)}`),
-      ),
-    ));
-  }
+  renderTradeLogList(document.getElementById('tradelog'), trades, 250);
 }
 
 // ---- activity feed ----

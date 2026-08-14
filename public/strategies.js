@@ -1,4 +1,4 @@
-import { el, api, fmtPnl, fmtPrice, timeAgo } from '/shared.js';
+import { el, api, fmtPnl, renderTradeLogList } from '/shared.js';
 
 const moneyFmt = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
 
@@ -131,24 +131,13 @@ async function renderDetail(a, base) {
   try {
     const trades = await strategyTrades(a.rule);
     if (trades.length) {
-      const table = el('table', { class: 'mini-table' },
-        el('thead', {}, el('tr', {}, ...['Side', 'Symbol', 'Qty', 'Entry', 'Exit', 'P&L', 'Opened', 'Exit reason'].map((h) => el('th', {}, h)))),
-        el('tbody', {}, ...trades.slice(0, 200).map((t) => el('tr', {},
-          el('td', { class: t.side === 'long' ? 'pnl-up' : 'pnl-down', style: 'text-align:left' }, t.side),
-          el('td', { style: 'text-align:left; font-weight:600' }, t.symbol),
-          el('td', {}, t.qty),
-          el('td', {}, fmtPrice(t.entry_price)),
-          el('td', {}, t.exit_price != null ? fmtPrice(t.exit_price) : '—'),
-          el('td', { class: Number.isFinite(t.pnl) ? (t.pnl >= 0 ? 'pnl-up' : 'pnl-down') : '' }, fmtPnl(t.pnl)),
-          el('td', { class: 'dim' }, timeAgo(t.opened_at)),
-          el('td', { class: 'dim', style: 'text-align:left' }, t.status === 'closed' ? (t.exit_reason || 'closed') : 'open'),
-        ))),
-      );
+      const logBox = el('div');
+      renderTradeLogList(logBox, trades, 200);
       grid.append(el('div', { class: 'panel' },
-        el('h2', {}, `Trades (${trades.length}${trades.length > 200 ? ', latest 200 shown' : ''})`),
-        el('div', { style: 'overflow-x:auto' }, table)));
+        el('h2', {}, `Trade log (${trades.length}${trades.length > 100 ? ' trades, latest 200 fills shown' : ' trades'})`),
+        logBox));
     }
-  } catch { /* trades table optional */ }
+  } catch { /* trade log optional */ }
 }
 
 function renderGrid(d) {
