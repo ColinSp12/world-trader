@@ -146,6 +146,65 @@ const flightLayer = L.layerGroup().addTo(map);
 
 const shipLayer = L.layerGroup().addTo(map);
 
+// ---- ambience: glow under active-signal events, animated arcs to the
+// related chokepoint. SVG renderer (not canvas) so CSS can animate the dashes.
+const fxRenderer = L.svg({ padding: 0.3 });
+const fxLayer = L.layerGroup().addTo(map);
+
+function nearestChokepoint(lat, lon) {
+  let best = null, bestD = Infinity;
+  for (const c of CHOKEPOINTS) {
+    const d = (c.lat - lat) ** 2 + (c.lon - lon) ** 2;
+    if (d < bestD) { bestD = d; best = c; }
+  }
+  return bestD < 40 * 40 ? best : null; // only when reasonably close (~<40°)
+}
+
+function arcLine(from, to) {
+  const mid = [(from[0] + to[0]) / 2 + Math.abs(from[1] - to[1]) * 0.18, (from[1] + to[1]) / 2];
+  const pts = [];
+  for (let i = 0; i <= 24; i++) {
+    const t = i / 24, a = 1 - t;
+    pts.push([
+      a * a * from[0] + 2 * a * t * mid[0] + t * t * to[0],
+      a * a * from[1] + 2 * a * t * mid[1] + t * t * to[1],
+    ]);
+  }
+  return L.polyline(pts, {
+    renderer: fxRenderer, className: 'arc-line', color: '#9085e9',
+    weight: 1.5, opacity: 0.65, dashArray: '6 9', interactive: false,
+  });
+}
+
+function renderAmbience(signals) {
+  fxLayer.clearLayers();
+  const active = signals.filter((s) => s.status === 'new' || s.status === 'taken');
+  for (const s of active.slice(0, 20)) {
+    const ev = s.event;
+    // pulsing ring around a chokepoint named in a transit-drop signal
+    if (s.rule === 'chokepoint-transit-drop') {
+      const cp = CHOKEPOINTS.find((c) => s.headline.includes(c.name));
+      if (cp) {
+        L.marker([cp.lat, cp.lon], {
+          icon: L.divIcon({ className: 'glow-icon', html: '<span class="glow choke"></span>', iconSize: [70, 70], iconAnchor: [35, 35] }),
+          interactive: false, keyboard: false,
+        }).addTo(fxLayer);
+      }
+      continue;
+    }
+    if (!ev || !Number.isFinite(ev.lat) || !Number.isFinite(ev.lon)) continue;
+    L.marker([ev.lat, ev.lon], {
+      icon: L.divIcon({ className: 'glow-icon', html: '<span class="glow"></span>', iconSize: [90, 90], iconAnchor: [45, 45] }),
+      interactive: false, keyboard: false,
+    }).addTo(fxLayer);
+    // arc to the nearest chokepoint for shipping/oil-flavored signals
+    if (s.rule === 'chokepoint-disruption' || s.rule === 'oil-producer-unrest') {
+      const cp = nearestChokepoint(ev.lat, ev.lon);
+      if (cp) arcLine([ev.lat, ev.lon], [cp.lat, cp.lon]).addTo(fxLayer);
+    }
+  }
+}
+
 // U+2708 points ~45° right of north in most fonts, hence the -45 offset.
 function planeIcon(track, mil) {
   return L.divIcon({
@@ -331,6 +390,7 @@ async function refresh() {
     renderMarkers(ev.events);
     renderEventList(ev.events);
     renderSignals(sig.signals);
+    renderAmbience(sig.signals);
     renderNews(news.items);
     document.getElementById('event-count').textContent = `(${ev.events.length})`;
     const status = document.getElementById('status');

@@ -546,11 +546,38 @@ function watchActivity(items) {
   if (lastActivityId !== null) {
     for (const a of items) {
       if (a.id <= lastActivityId) break;
-      if (a.kind === 'open' || a.kind === 'close') toast(a.message, a.kind);
+      if (a.kind === 'open' || a.kind === 'close' || a.kind === 'evolve') toast(a.message, a.kind);
     }
   }
   lastActivityId = items[0].id;
 }
+
+// ---- "what's Claude thinking" ticker: rotates the engine's own narration ----
+let thinkItems = [];
+let thinkIdx = -1;
+function updateThinkFeed(items) {
+  const wasEmpty = !thinkItems.length;
+  thinkItems = items.filter((a) => ['plan', 'skip', 'info', 'evolve'].includes(a.kind)).slice(0, 15);
+  if (wasEmpty && thinkItems.length) rotateThink();
+}
+function rotateThink() {
+  if (!thinkItems.length) return;
+  thinkIdx = (thinkIdx + 1) % thinkItems.length;
+  const m = document.getElementById('think-msg');
+  const a = thinkItems[thinkIdx];
+  m.classList.remove('swap');
+  void m.offsetWidth; // restart the fade
+  m.classList.add('swap');
+  m.classList.toggle('evolve', a.kind === 'evolve');
+  m.textContent = `${a.message} · ${timeAgo(a.ts)}`;
+}
+setInterval(rotateThink, 7000);
+
+// ---- compact density toggle ----
+document.getElementById('compact-toggle').addEventListener('click', () => {
+  const on = document.documentElement.classList.toggle('compact');
+  localStorage.setItem('wt-compact', on ? '1' : '0');
+});
 
 async function loadAll() {
   try {
@@ -562,6 +589,7 @@ async function loadAll() {
     renderActivity(activity.activity);
     renderPerformance(perf.performance);
     watchActivity(activity.activity);
+    updateThinkFeed(activity.activity);
   } catch (err) {
     setStatus(`Load failed: ${err.message}`);
   }

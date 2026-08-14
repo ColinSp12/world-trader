@@ -1,4 +1,9 @@
 // Shared helpers — all rendering uses textContent (event data is external text).
+
+// density preference applies on every page before first paint
+if (typeof localStorage !== 'undefined' && localStorage.getItem('wt-compact') === '1') {
+  document.documentElement.classList.add('compact');
+}
 export function el(tag, attrs = {}, ...children) {
   const node = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs)) {

@@ -64,7 +64,31 @@ db.exec(`
   );
   CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS equity_snapshots (ts INTEGER PRIMARY KEY, equity REAL NOT NULL);
+  CREATE TABLE IF NOT EXISTS strategy_params (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule TEXT NOT NULL,
+    gen INTEGER NOT NULL,
+    params TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    activated_at INTEGER,
+    retired_at INTEGER,
+    trades INTEGER NOT NULL DEFAULT 0,
+    pnl REAL NOT NULL DEFAULT 0,
+    win_rate REAL,
+    status TEXT NOT NULL DEFAULT 'active',
+    note TEXT
+  );
+  CREATE TABLE IF NOT EXISTS rule_tuning (
+    rule TEXT PRIMARY KEY,
+    stop_mult REAL NOT NULL DEFAULT 1,
+    target_mult REAL NOT NULL DEFAULT 1,
+    horizon_mult REAL NOT NULL DEFAULT 1,
+    updated_at INTEGER,
+    note TEXT
+  );
 `);
+
+const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
 
 // Migrate databases created before the strategy columns existed.
 for (const col of ['strategy TEXT', 'variant TEXT']) {
@@ -544,15 +568,21 @@ const STRATEGY_VARIANTS = {
   runner: { stopAdr: 1.4, targetR: 2.0, horizonMult: 1.0 },
 };
 
+// Per-rule learned overrides (rule_tuning table) — evolved daily from each
+// rule's recent closed trades; buildPlan applies them on top of the variant.
+const ruleTuning = new Map();
+for (const r of db.prepare('SELECT * FROM rule_tuning').all()) ruleTuning.set(r.rule, r);
+
 async function buildPlan(direction, rule, symbol, v = STRATEGY_VARIANTS.base, sizeFactor = 1) {
   const q = await getQuote(symbol);
   const adr = Math.min(Math.max(q.adrPct ?? 0.02, 0.008), 0.06);
   const entry = q.price;
-  const stopDist = entry * Math.min(Math.max(v.stopAdr * adr, 0.01), 0.06);
+  const tune = ruleTuning.get(rule);
+  const stopDist = entry * clamp(v.stopAdr * adr * (tune?.stop_mult ?? 1), 0.01, 0.08);
   const dir = direction === 'short' ? -1 : 1; // 'watch' plans as a long suggestion
   const stop = entry - dir * stopDist;
-  const target = entry + dir * v.targetR * stopDist;
-  const horizon = (RULE_HORIZON_DAYS[rule] ?? 4) * v.horizonMult;
+  const target = entry + dir * v.targetR * stopDist * (tune?.target_mult ?? 1);
+  const horizon = (RULE_HORIZON_DAYS[rule] ?? 4) * v.horizonMult * (tune?.horizon_mult ?? 1);
 
   const equity = STARTING_EQUITY + realizedTotal();
   let riskFrac = RISK_PER_TRADE;
@@ -824,6 +854,120 @@ const SCALP = {
 };
 const PAIR_TO_SYM = new Map(Object.entries(SCALP_PAIRS).map(([s, p]) => [p, s]));
 const scalpHist = new Map(); // symbol -> [{ts, price}]
+
+// ---- recursive learning: the scalper evolves in generations ----
+// Trades are tagged variant = g<gen>. When a generation accumulates enough
+// closed trades, the engine diagnoses HOW it won/lost, mutates the parameters
+// directionally, retires the generation, and narrates the lesson.
+const EVOLVE_MIN_CLOSED = SCALP_TEST ? 6 : 30;
+const SCALP_TUNABLE = ['enterBps', 'targetBps', 'stopBps', 'maxHoldMs', 'lookbackMs'];
+let scalpGen = 1;
+
+function applyTestOverrides() {
+  if (SCALP_TEST) { SCALP.enterBps = 0.5; SCALP.maxHoldMs = 45 * 1000; }
+}
+
+function loadScalpGen() {
+  let row = db.prepare("SELECT * FROM strategy_params WHERE rule = ? AND status = 'active' ORDER BY gen DESC LIMIT 1").get(SCALP_RULE);
+  if (!row) {
+    const params = Object.fromEntries(SCALP_TUNABLE.map((k) => [k, SCALP[k]]));
+    db.prepare("INSERT INTO strategy_params (rule, gen, params, created_at, activated_at, status, note) VALUES (?, 1, ?, ?, ?, 'active', 'starting parameters')")
+      .run(SCALP_RULE, JSON.stringify(params), Date.now(), Date.now());
+    row = db.prepare("SELECT * FROM strategy_params WHERE rule = ? AND status = 'active'").get(SCALP_RULE);
+  }
+  Object.assign(SCALP, JSON.parse(row.params));
+  applyTestOverrides();
+  scalpGen = row.gen;
+}
+db.prepare("UPDATE trades SET variant = 'g1' WHERE strategy = ? AND variant = 'scalp'").run(SCALP_RULE);
+loadScalpGen();
+
+function evolveScalper() {
+  const s = db.prepare(`SELECT COUNT(*) AS closed,
+      SUM(CASE WHEN ${AUTO_PNL_SQL} > 0 THEN 1 ELSE 0 END) AS wins,
+      COALESCE(SUM(${AUTO_PNL_SQL}), 0) AS pnl,
+      SUM(CASE WHEN exit_reason = 'scalp stop' THEN 1 ELSE 0 END) AS stops,
+      SUM(CASE WHEN exit_reason = 'scalp time' THEN 1 ELSE 0 END) AS timeouts,
+      SUM(CASE WHEN exit_reason = 'scalp target' THEN 1 ELSE 0 END) AS targets
+    FROM trades WHERE status = 'closed' AND strategy = ? AND variant = ?`).get(SCALP_RULE, `g${scalpGen}`);
+  if (s.closed < EVOLVE_MIN_CLOSED) return;
+
+  const winRate = s.wins / s.closed;
+  db.prepare("UPDATE strategy_params SET trades = ?, pnl = ?, win_rate = ?, retired_at = ?, status = 'retired' WHERE rule = ? AND gen = ?")
+    .run(s.closed, s.pnl, winRate, Date.now(), SCALP_RULE, scalpGen);
+
+  const p = Object.fromEntries(SCALP_TUNABLE.map((k) => [k, SCALP[k]]));
+  const reasons = [];
+  const jitter = (v, f) => v * (1 + (Math.random() * 2 - 1) * f);
+  if (s.pnl < 0) {
+    const timeoutShare = s.timeouts / s.closed;
+    const stopShare = s.stops / s.closed;
+    if (timeoutShare >= 0.5) {
+      p.enterBps *= 1.35; p.targetBps *= 0.85;
+      reasons.push(`${Math.round(timeoutShare * 100)}% of exits were fee-bleeding time-outs — demanding stronger momentum to enter and taking profit sooner`);
+    }
+    if (stopShare >= 0.45) {
+      p.stopBps *= 1.25; p.enterBps *= 1.15;
+      reasons.push(`${Math.round(stopShare * 100)}% stopped out — widening the stop and raising the entry bar`);
+    }
+    if (!reasons.length) {
+      p.enterBps *= 1.25; p.maxHoldMs *= 1.2;
+      reasons.push('losing with no dominant exit pattern — trading less and holding winners longer');
+    }
+  } else {
+    for (const k of ['enterBps', 'targetBps', 'stopBps']) p[k] = jitter(p[k], 0.12);
+    reasons.push('profitable — exploring nearby parameters to keep improving');
+  }
+  p.enterBps = clamp(p.enterBps, 2, 40);
+  p.targetBps = clamp(p.targetBps, Math.max(6, SCALP.feeBps * 4), 80);
+  p.stopBps = clamp(p.stopBps, 4, 60);
+  p.maxHoldMs = clamp(p.maxHoldMs, 60 * 1000, 30 * 60 * 1000);
+  p.lookbackMs = clamp(p.lookbackMs, 20 * 1000, 5 * 60 * 1000);
+
+  const newGen = scalpGen + 1;
+  db.prepare("INSERT INTO strategy_params (rule, gen, params, created_at, activated_at, status, note) VALUES (?, ?, ?, ?, ?, 'active', ?)")
+    .run(SCALP_RULE, newGen, JSON.stringify(p), Date.now(), Date.now(), reasons.join('; '));
+  Object.assign(SCALP, p);
+  applyTestOverrides();
+  scalpGen = newGen;
+  logActivity('evolve', `EVOLVED momo-scalper gen ${newGen - 1} → gen ${newGen} after ${s.closed} trades (P&L ${s.pnl >= 0 ? '+' : ''}${s.pnl.toFixed(2)}, ${Math.round(winRate * 100)}% wins, ${s.targets} targets/${s.stops} stops/${s.timeouts} time-outs). Lesson: ${reasons.join('; ')}. New params: enter ${p.enterBps.toFixed(1)}bps · target ${p.targetBps.toFixed(1)}bps · stop ${p.stopBps.toFixed(1)}bps · hold ${(p.maxHoldMs / 60000).toFixed(1)}min`);
+  broadcast('fill', { action: 'evolve', symbol: SCALP_RULE });
+}
+
+// ---- recursive learning for the slow strategies (daily pass) ----
+function evolveSlowRules() {
+  for (const rule of Object.keys(STRATEGY_META)) {
+    if (rule === SCALP_RULE || rule === 'headline-risk') continue;
+    const since = ruleTuning.get(rule)?.updated_at || 0;
+    const s = db.prepare(`SELECT COUNT(*) AS closed, COALESCE(SUM(${AUTO_PNL_SQL}), 0) AS pnl,
+        SUM(CASE WHEN exit_reason = 'stop hit' THEN 1 ELSE 0 END) AS stops,
+        SUM(CASE WHEN exit_reason = 'target hit' THEN 1 ELSE 0 END) AS targets,
+        SUM(CASE WHEN exit_reason = 'time exit' THEN 1 ELSE 0 END) AS timeouts
+      FROM trades WHERE status = 'closed' AND auto = 1 AND strategy = ? AND closed_at > ?`).get(rule, since);
+    if (s.closed < 8) continue;
+    const t = ruleTuning.get(rule) || { stop_mult: 1, target_mult: 1, horizon_mult: 1 };
+    const reasons = [];
+    if (s.pnl < 0 && s.stops / s.closed >= 0.5) {
+      t.stop_mult = clamp(t.stop_mult * 1.2, 0.5, 2.5);
+      reasons.push(`${s.stops}/${s.closed} recent trades stopped out at a net loss — widening stops`);
+    } else if (s.pnl < 0 && s.timeouts / s.closed >= 0.5) {
+      t.target_mult = clamp(t.target_mult * 0.85, 0.4, 2.5);
+      reasons.push(`${s.timeouts}/${s.closed} timed out before reaching the target — bringing targets closer`);
+    } else if (s.pnl > 0 && s.targets / s.closed >= 0.5) {
+      t.target_mult = clamp(t.target_mult * 1.15, 0.4, 2.5);
+      reasons.push(`targets hitting ${s.targets}/${s.closed} — stretching for more`);
+    } else {
+      continue;
+    }
+    db.prepare(`INSERT INTO rule_tuning (rule, stop_mult, target_mult, horizon_mult, updated_at, note) VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(rule) DO UPDATE SET stop_mult = excluded.stop_mult, target_mult = excluded.target_mult,
+        horizon_mult = excluded.horizon_mult, updated_at = excluded.updated_at, note = excluded.note`)
+      .run(rule, t.stop_mult, t.target_mult, t.horizon_mult, Date.now(), reasons.join('; '));
+    t.updated_at = Date.now();
+    ruleTuning.set(rule, t);
+    logActivity('evolve', `TUNED ${rule} after ${s.closed} closed trades (window P&L ${s.pnl >= 0 ? '+' : ''}${s.pnl.toFixed(2)}). Lesson: ${reasons.join('; ')} → stop×${t.stop_mult.toFixed(2)} · target×${t.target_mult.toFixed(2)}`);
+  }
+}
 const livePrices = new Map(); // symbol -> { price, ts } — fed by Binance websocket
 let scalperOn = getSetting('scalper', '1') === '1';
 let scalperRunning = false;
@@ -930,12 +1074,12 @@ async function scalperTick() {
         const fill = px * (1 + dir * SCALP.feeBps / 10000); // adverse fee on entry
         const qty = +(SCALP.notional / fill).toFixed(6);
         db.prepare(`INSERT INTO trades (opened_at, symbol, side, qty, entry_price, stop_price, target_price, expires_at, auto, signal_id, thesis, strategy, variant)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?, 'scalp')`)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?, ?)`)
           .run(now, sym, side, qty, fill,
             fill * (1 - dir * SCALP.stopBps / 10000),
             fill * (1 + dir * SCALP.targetBps / 10000),
             now + SCALP.maxHoldMs,
-            `1-min momentum ${momBps.toFixed(1)} bps`, SCALP_RULE);
+            `1-min momentum ${momBps.toFixed(1)} bps`, SCALP_RULE, `g${scalpGen}`);
         logActivity('scalp', `SCALP ${side} ${qty} ${sym} @ ${fill.toFixed(2)} (momentum ${momBps > 0 ? '+' : ''}${momBps.toFixed(1)} bps)`);
         broadcast('fill', { action: 'open', symbol: sym });
       }
@@ -1317,6 +1461,21 @@ const server = http.createServer(async (req, res) => {
         ships: list,
       });
     }
+    if (p === '/api/evolution' && req.method === 'GET') {
+      return json(res, 200, {
+        generations: db.prepare('SELECT * FROM strategy_params ORDER BY rule, gen').all()
+          .map((r) => ({ ...r, params: JSON.parse(r.params) })),
+        tuning: db.prepare('SELECT * FROM rule_tuning ORDER BY rule').all(),
+        log: db.prepare("SELECT * FROM activity WHERE kind = 'evolve' ORDER BY id DESC LIMIT 50").all(),
+      });
+    }
+    if (p === '/api/daily-pnl' && req.method === 'GET') {
+      return json(res, 200, {
+        days: db.prepare(`SELECT strftime('%Y-%m-%d', closed_at / 1000, 'unixepoch') AS day,
+            COALESCE(SUM(${AUTO_PNL_SQL}), 0) AS pnl, COUNT(*) AS trades
+          FROM trades WHERE status = 'closed' GROUP BY day ORDER BY day`).all(),
+      });
+    }
     if (p === '/api/stream' && req.method === 'GET') {
       res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
       res.write(': connected\n\n');
@@ -1510,6 +1669,8 @@ server.listen(PORT, () => {
   setInterval(() => scanTechnicals().catch((e) => console.error('[tech] scan failed:', e.message)), 60 * 60 * 1000);
   startBinanceStream();
   setInterval(() => scalperTick(), SCALP.tickMs);
+  setInterval(() => { try { evolveScalper(); } catch (e) { console.error('[evolve] scalper:', e.message); } }, 60 * 1000);
+  setInterval(() => { try { evolveSlowRules(); } catch (e) { console.error('[evolve] rules:', e.message); } }, 6 * 3600 * 1000);
   console.log(`[scalper] ${scalperOn ? 'active' : 'paused'} — ${Object.keys(SCALP_PAIRS).length} pairs streaming, decisions every ${SCALP.tickMs}ms${SCALP_TEST ? ' (TEST MODE)' : ''}`);
   if (aisKey) startAisStream();
 });

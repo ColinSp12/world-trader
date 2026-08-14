@@ -204,6 +204,32 @@ async function renderDetail(a, base) {
     chartCard,
   );
 
+  // generation history — the recursive-learning trail for this strategy
+  const gens = (evoCache?.generations || []).filter((g) => g.rule === a.rule);
+  if (gens.length) {
+    const fmtParams = (p) => `enter ${p.enterBps?.toFixed(1)}bps · tgt ${p.targetBps?.toFixed(1)} · stop ${p.stopBps?.toFixed(1)} · hold ${(p.maxHoldMs / 60000).toFixed(1)}m`;
+    mainCol.append(el('div', { class: 'panel' },
+      el('h2', {}, `Generations — the strategy evolving (${gens.length})`),
+      el('div', { style: 'overflow-x:auto' }, el('table', { class: 'mini-table' },
+        el('thead', {}, el('tr', {}, ...['Gen', 'Status', 'Parameters', 'Trades', 'P&L', 'Win %', 'Lesson learned'].map((h) => el('th', {}, h)))),
+        el('tbody', {}, ...gens.map((g) => el('tr', {},
+          el('td', { style: 'text-align:left; font-weight:600' }, `g${g.gen}`),
+          el('td', { style: 'text-align:left' }, g.status === 'active' ? '● live' : 'retired'),
+          el('td', { style: 'text-align:left; font-size:11px' }, fmtParams(g.params)),
+          el('td', {}, g.status === 'retired' ? g.trades : '—'),
+          el('td', { class: g.status === 'retired' ? (g.pnl > 0 ? 'pnl-up' : g.pnl < 0 ? 'pnl-down' : '') : '' }, g.status === 'retired' ? fmtPnl(g.pnl) : '—'),
+          el('td', {}, g.win_rate != null ? `${Math.round(g.win_rate * 100)}%` : '—'),
+          el('td', { style: 'text-align:left; font-size:11px; max-width: 300px; white-space: normal' }, g.note || ''),
+        ))),
+      )),
+    ));
+  }
+  const tune = (evoCache?.tuning || []).find((t) => t.rule === a.rule);
+  if (tune) {
+    mainCol.append(el('div', { class: 'panel', style: 'padding: 10px 14px' },
+      el('div', { class: 'dim-note' }, `🧠 learned tuning: stop×${tune.stop_mult.toFixed(2)} · target×${tune.target_mult.toFixed(2)} — ${tune.note || ''}`)));
+  }
+
   const tapeBox = el('div', { class: 'scroll' });
   const tape = el('section', { class: 'panel detail-tape' },
     el('h2', {}, 'Live fills'),
@@ -219,9 +245,52 @@ async function renderDetail(a, base) {
   }
 }
 
+// ---- daily P&L calendar heatmap (GitHub-style) ----
+function heatmap(days) {
+  const byDay = new Map(days.map((d) => [d.day, d]));
+  const maxAbs = Math.max(1, ...days.map((d) => Math.abs(d.pnl)));
+  const grid = el('div', { class: 'heatmap' });
+  const today = new Date();
+  for (let w = 11; w >= 0; w--) {
+    const col = el('div', { class: 'hm-col' });
+    for (let d = 6; d >= 0; d--) {
+      const date = new Date(today);
+      date.setDate(date.getDate() - (w * 7 + d));
+      const key = date.toISOString().slice(0, 10);
+      const rec = byDay.get(key);
+      const cell = el('span', {
+        class: 'hm-cell',
+        title: rec ? `${key}: ${rec.pnl >= 0 ? '+' : '−'}$${Math.abs(rec.pnl).toFixed(2)} · ${rec.trades} trade${rec.trades === 1 ? '' : 's'}` : key,
+      });
+      if (rec && rec.pnl !== 0) {
+        const a = 0.3 + 0.7 * Math.min(1, Math.abs(rec.pnl) / maxAbs);
+        cell.style.background = rec.pnl > 0 ? `rgba(12, 163, 12, ${a.toFixed(2)})` : `rgba(208, 59, 59, ${a.toFixed(2)})`;
+      }
+      col.append(cell);
+    }
+    grid.append(col);
+  }
+  return el('div', { class: 'panel hm-panel' },
+    el('h2', {}, 'Daily P&L — last 12 weeks'),
+    grid);
+}
+
+// ---- learning log: the engine narrating what it changed and why ----
+function learningLog(items) {
+  return el('div', { class: 'panel' },
+    el('h2', {}, '🧠 Learning log'),
+    el('div', { class: 'scroll', style: 'max-height: 240px' },
+      ...items.map((a) => el('div', { class: 'act act-evolve' },
+        el('span', { class: 'act-time' }, new Date(a.ts).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })),
+        el('span', { class: 'act-icon' }, '◆'),
+        el('span', {}, a.message)))),
+  );
+}
+
 function renderGrid(d) {
   const grid = document.getElementById('grid');
   grid.replaceChildren();
+  if (dailyCache?.days?.length) grid.append(heatmap(dailyCache.days));
   for (const [family, title, sub] of FAMILIES) {
     const members = d.accounts.filter((a) => a.family === family);
     if (!members.length) continue;
@@ -231,12 +300,17 @@ function renderGrid(d) {
     ));
     grid.append(el('div', { class: 'family-grid' }, ...members.map((a) => card(a, d.base))));
   }
+  if (evoCache?.log?.length) grid.append(learningLog(evoCache.log));
 }
 
 let dataCache = null;
+let evoCache = null;
+let dailyCache = null;
 async function load() {
   try {
-    dataCache = await api('/api/strategy-accounts');
+    [dataCache, evoCache, dailyCache] = await Promise.all([
+      api('/api/strategy-accounts'), api('/api/evolution'), api('/api/daily-pnl'),
+    ]);
     route();
     document.getElementById('status').textContent = `${dataCache.accounts.filter((a) => !a.watchOnly).length} live strategies`;
   } catch (err) {
