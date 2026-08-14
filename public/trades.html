@@ -73,8 +73,15 @@
   </section>
 
   <section class="panel" id="blotter-panel">
-    <h2>Positions &amp; history</h2>
+    <h2>Claude's trades
+      <span class="tabbtns">
+        <button id="tab-trades" class="active">Trades</button>
+        <button id="tab-perf">Strategy performance</button>
+      </span>
+      <a class="btn small" href="/api/trades.csv" style="margin-left:auto" download>Export CSV</a>
+    </h2>
     <div class="scroll" id="blotter"></div>
+    <div class="scroll" id="perf" hidden></div>
   </section>
 
   <section class="panel" id="activity-panel">

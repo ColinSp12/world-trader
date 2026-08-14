@@ -34,7 +34,9 @@ db.exec(`
     auto INTEGER NOT NULL DEFAULT 0,
     signal_id TEXT,
     thesis TEXT,
-    exit_reason TEXT
+    exit_reason TEXT,
+    strategy TEXT,
+    variant TEXT
   );
   CREATE TABLE IF NOT EXISTS signals (
     id TEXT PRIMARY KEY,
@@ -61,7 +63,16 @@ db.exec(`
     message TEXT NOT NULL
   );
   CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS equity_snapshots (ts INTEGER PRIMARY KEY, equity REAL NOT NULL);
 `);
+
+// Migrate databases created before the strategy columns existed.
+for (const col of ['strategy TEXT', 'variant TEXT']) {
+  try { db.exec(`ALTER TABLE trades ADD COLUMN ${col}`); } catch { /* column already exists */ }
+}
+db.prepare(`UPDATE trades SET
+  strategy = COALESCE(strategy, (SELECT rule FROM signals WHERE signals.id = trades.signal_id), 'manual'),
+  variant = COALESCE(variant, 'base')`).run();
 
 const STARTING_EQUITY = 100000;
 
@@ -495,29 +506,75 @@ const RULE_HORIZON_DAYS = {
   'hurricane-energy': 4, 'global-risk-off': 5, 'headline-risk': 3,
 };
 
-async function planSignal(row) {
-  const q = await getQuote(row.tv_symbol);
+// Exit-style variants — each auto trade is tagged (strategy rule × variant) so
+// performance can be compared per combination and sizing adapted over time.
+const STRATEGY_VARIANTS = {
+  tight:  { stopAdr: 1.0, targetR: 1.5, horizonMult: 0.6 },
+  base:   { stopAdr: 1.5, targetR: 2.0, horizonMult: 1.0 },
+  runner: { stopAdr: 2.0, targetR: 3.0, horizonMult: 1.5 },
+};
+
+async function buildPlan(direction, rule, symbol, v = STRATEGY_VARIANTS.base, sizeFactor = 1) {
+  const q = await getQuote(symbol);
   const adr = Math.min(Math.max(q.adrPct ?? 0.02, 0.008), 0.06);
   const entry = q.price;
-  const stopDist = entry * Math.min(Math.max(1.5 * adr, 0.015), 0.08);
-  const dir = row.direction === 'short' ? -1 : 1; // 'watch' plans as a long suggestion
+  const stopDist = entry * Math.min(Math.max(v.stopAdr * adr, 0.012), 0.10);
+  const dir = direction === 'short' ? -1 : 1; // 'watch' plans as a long suggestion
   const stop = entry - dir * stopDist;
-  const target = entry + dir * 2 * stopDist;      // fixed 2R reward:risk
-  const horizon = RULE_HORIZON_DAYS[row.rule] ?? 4;
+  const target = entry + dir * v.targetR * stopDist;
+  const horizon = (RULE_HORIZON_DAYS[rule] ?? 4) * v.horizonMult;
 
-  let equity = STARTING_EQUITY + realizedTotal();
+  const equity = STARTING_EQUITY + realizedTotal();
   let riskFrac = RISK_PER_TRADE;
   try {
     const vix = await getQuote('^VIX');
     if (vix.price >= 30) riskFrac = RISK_PER_TRADE / 2; // defensive sizing in panicky tape
   } catch { /* VIX unavailable — keep normal sizing */ }
-  let qty = Math.floor((equity * riskFrac) / stopDist);
+  let qty = Math.floor((equity * riskFrac * sizeFactor) / stopDist);
   if (qty * entry > equity * MAX_POSITION_FRACTION) qty = Math.floor((equity * MAX_POSITION_FRACTION) / entry);
   qty = Math.max(qty, 1);
-
-  db.prepare('UPDATE signals SET plan_entry = ?, plan_stop = ?, plan_target = ?, plan_qty = ?, horizon_days = ? WHERE id = ?')
-    .run(entry, stop, target, qty, horizon, row.id);
   return { entry, stop, target, qty, horizon };
+}
+
+async function planSignal(row) {
+  const plan = await buildPlan(row.direction, row.rule, row.tv_symbol);
+  db.prepare('UPDATE signals SET plan_entry = ?, plan_stop = ?, plan_target = ?, plan_qty = ?, horizon_days = ? WHERE id = ?')
+    .run(plan.entry, plan.stop, plan.target, plan.qty, plan.horizon, row.id);
+  return plan;
+}
+
+// ---- strategy scorecard: sample-balanced variant picking + adaptive sizing ----
+const AUTO_PNL_SQL = `(exit_price - entry_price) * (CASE side WHEN 'long' THEN 1 ELSE -1 END) * qty`;
+
+// Least-sampled variant that is still allowed to trade (factor > 0). A paused
+// variant must be excluded here, not just at entry: its count freezes at the
+// minimum, so a pause-blind pick would select it forever and deadlock the
+// whole rule. base is always eligible (0.25 probe floor), so a rule can never
+// have every variant paused.
+function pickVariant(rule) {
+  let best = null;
+  for (const name of Object.keys(STRATEGY_VARIANTS)) {
+    const adj = sizeAdjustment(rule, name);
+    if (adj.factor === 0) continue;
+    const c = db.prepare('SELECT COUNT(*) AS c FROM trades WHERE auto = 1 AND strategy = ? AND variant = ?').get(rule, name).c;
+    if (!best || c < best.c) best = { name, c, adj };
+  }
+  return best;
+}
+
+// Losing combos get sized down after 5 closed trades and paused after 10;
+// the base variant is never fully paused (quarter-size probe) so a strategy
+// can still earn its way back. Winners keep full size.
+function sizeAdjustment(rule, variant) {
+  const s = db.prepare(`SELECT COUNT(*) AS closed, COALESCE(SUM(${AUTO_PNL_SQL}), 0) AS pnl
+    FROM trades WHERE status = 'closed' AND auto = 1 AND strategy = ? AND variant = ?`).get(rule, variant);
+  if (s.closed >= 10 && s.pnl < 0) {
+    return variant === 'base'
+      ? { factor: 0.25, why: `${rule}/base negative after ${s.closed} closed — probing at quarter size` }
+      : { factor: 0, why: `${rule}/${variant} paused — negative P&L after ${s.closed} closed trades` };
+  }
+  if (s.closed >= 5 && s.pnl < 0) return { factor: 0.5, why: `${rule}/${variant} negative after ${s.closed} closed — half size` };
+  return { factor: 1, why: null };
 }
 
 let autopilotRunning = false;
@@ -553,13 +610,25 @@ async function autopilotTick() {
           continue;
         }
         try {
-          const q = await getQuote(s.tv_symbol); // fresh fill price
-          db.prepare(`INSERT INTO trades (opened_at, symbol, side, qty, entry_price, stop_price, target_price, expires_at, auto, signal_id, thesis)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`)
-            .run(now, s.tv_symbol, s.direction, s.plan_qty, q.price, s.plan_stop, s.plan_target,
-              now + s.horizon_days * 24 * 3600 * 1000, s.id, s.headline);
+          const pick = pickVariant(s.rule);
+          if (!pick) { // defensive — base always has factor > 0
+            db.prepare("UPDATE signals SET status = 'skipped' WHERE id = ?").run(s.id);
+            logActivity('skip', `All ${s.rule} variants paused — ${s.tv_symbol} not traded`);
+            continue;
+          }
+          const { name: variant, adj } = pick;
+          if (adj.why) logActivity('info', adj.why);
+          const plan = await buildPlan(s.direction, s.rule, s.tv_symbol, STRATEGY_VARIANTS[variant], adj.factor);
+          // Write the executed plan back so the signal card and history show
+          // the trade the autopilot actually took, not the baseline sketch.
+          db.prepare('UPDATE signals SET plan_entry = ?, plan_stop = ?, plan_target = ?, plan_qty = ?, horizon_days = ? WHERE id = ?')
+            .run(plan.entry, plan.stop, plan.target, plan.qty, plan.horizon, s.id);
+          db.prepare(`INSERT INTO trades (opened_at, symbol, side, qty, entry_price, stop_price, target_price, expires_at, auto, signal_id, thesis, strategy, variant)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)`)
+            .run(now, s.tv_symbol, s.direction, plan.qty, plan.entry, plan.stop, plan.target,
+              now + plan.horizon * 24 * 3600 * 1000, s.id, s.headline, s.rule, variant);
           db.prepare("UPDATE signals SET status = 'taken' WHERE id = ?").run(s.id);
-          logActivity('open', `AUTO opened ${s.direction} ${s.plan_qty} ${s.tv_symbol} @ ${q.price.toFixed(2)} · stop ${s.plan_stop.toFixed(2)} · target ${s.plan_target.toFixed(2)} · exit by ${new Date(now + s.horizon_days * 86400000).toISOString().slice(0, 10)} — ${s.headline}`);
+          logActivity('open', `AUTO opened ${s.direction} ${plan.qty} ${s.tv_symbol} @ ${plan.entry.toFixed(2)} · stop ${plan.stop.toFixed(2)} · target ${plan.target.toFixed(2)} · ${s.rule}/${variant} · exit by ${new Date(now + plan.horizon * 86400000).toISOString().slice(0, 10)} — ${s.headline}`);
         } catch (err) {
           logActivity('info', `Entry failed for ${s.tv_symbol}: ${err.message}`);
         }
@@ -581,11 +650,61 @@ async function autopilotTick() {
         }
       }
     }
+    await snapshotEquity();
   } catch (err) {
     console.error('[autopilot] tick failed:', err.message);
   } finally {
     autopilotRunning = false;
   }
+}
+
+// ---------------------------------------------------------------- flights
+// Live military aircraft from adsb.lol's open API — a map garnish, fetched
+// on demand (only while someone is watching the map) and cached 45s.
+const flightCache = { items: [], fetchedAt: 0 };
+const FLIGHT_TTL_MS = 45 * 1000;
+
+async function getFlights() {
+  if (Date.now() - flightCache.fetchedAt < FLIGHT_TTL_MS) return flightCache.items;
+  const data = await fetchJson('https://api.adsb.lol/v2/mil');
+  const items = [];
+  for (const a of data.ac || []) {
+    if (!Number.isFinite(a.lat) || !Number.isFinite(a.lon)) continue;
+    items.push({
+      hex: a.hex,
+      callsign: (a.flight || '').trim() || (a.r || '').trim() || a.hex,
+      reg: a.r || '',
+      type: a.t || '',
+      alt: Number.isFinite(a.alt_baro) ? a.alt_baro : (a.alt_baro === 'ground' ? 0 : null),
+      speed: Number.isFinite(a.gs) ? Math.round(a.gs) : null,
+      track: Number.isFinite(a.track) ? a.track : 0,
+      lat: a.lat, lon: a.lon,
+    });
+  }
+  flightCache.items = items;
+  flightCache.fetchedAt = Date.now();
+  return items;
+}
+
+// ---------------------------------------------------------------- equity history
+const SNAPSHOT_INTERVAL_MS = 10 * 60 * 1000;
+
+async function snapshotEquity() {
+  const now = Date.now();
+  const last = db.prepare('SELECT MAX(ts) AS ts FROM equity_snapshots').get().ts || 0;
+  if (now - last < SNAPSHOT_INTERVAL_MS) return;
+  const open = db.prepare("SELECT * FROM trades WHERE status = 'open'").all();
+  let unrealized = 0;
+  if (open.length) {
+    const quotes = await getQuotes([...new Set(open.map((t) => t.symbol))]);
+    for (const t of open) {
+      const pnl = tradePnl(t, quotes[t.symbol]?.price);
+      if (pnl != null) unrealized += pnl;
+    }
+  }
+  db.prepare('INSERT OR REPLACE INTO equity_snapshots (ts, equity) VALUES (?, ?)')
+    .run(now, STARTING_EQUITY + realizedTotal() + unrealized);
+  db.prepare('DELETE FROM equity_snapshots WHERE ts < ?').run(now - 90 * 24 * 3600 * 1000);
 }
 
 // ---------------------------------------------------------------- static files
@@ -663,6 +782,7 @@ const server = http.createServer(async (req, res) => {
       const realized = closed.reduce((s, t) => s + (t.pnl ?? 0), 0);
       const unrealized = open.reduce((s, t) => s + (t.pnl ?? 0), 0);
       const wins = closed.filter((t) => (t.pnl ?? 0) > 0).length;
+      const autoTrades = enriched.filter((t) => t.auto);
       return json(res, 200, {
         trades: enriched,
         summary: {
@@ -672,8 +792,47 @@ const server = http.createServer(async (req, res) => {
           startingEquity: STARTING_EQUITY,
           winRate: closed.length ? wins / closed.length : null,
           autopilot: autopilotOn,
+          claudePnl: autoTrades.reduce((s, t) => s + (t.pnl ?? 0), 0),
+          claudeCount: autoTrades.length,
         },
       });
+    }
+    if (p === '/api/flights' && req.method === 'GET') {
+      try {
+        return json(res, 200, { fetchedAt: flightCache.fetchedAt, flights: await getFlights() });
+      } catch (err) {
+        // serve last-known flights rather than failing the map
+        return json(res, 200, { fetchedAt: flightCache.fetchedAt, flights: flightCache.items, error: err.message });
+      }
+    }
+    if (p === '/api/equity-history' && req.method === 'GET') {
+      return json(res, 200, {
+        startingEquity: STARTING_EQUITY,
+        history: db.prepare('SELECT ts, equity FROM equity_snapshots ORDER BY ts').all(),
+      });
+    }
+    if (p === '/api/trades.csv' && req.method === 'GET') {
+      const all = db.prepare('SELECT * FROM trades ORDER BY opened_at').all();
+      const cols = ['id', 'opened_at', 'closed_at', 'symbol', 'side', 'qty', 'entry_price', 'exit_price', 'stop_price', 'target_price', 'status', 'auto', 'strategy', 'variant', 'exit_reason', 'thesis'];
+      const esc = (v) => (v == null ? '' : /[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v));
+      const lines = [cols.join(',')];
+      for (const t of all) {
+        lines.push(cols.map((c) => (c === 'opened_at' || c === 'closed_at') ? (t[c] ? new Date(t[c]).toISOString() : '') : esc(t[c])).join(','));
+      }
+      res.writeHead(200, { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': 'attachment; filename="world-trader-trades.csv"' });
+      return res.end(lines.join('\r\n'));
+    }
+    if (p === '/api/performance' && req.method === 'GET') {
+      const rows = db.prepare(`SELECT strategy, variant,
+          COUNT(*) AS total,
+          SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) AS open,
+          SUM(CASE WHEN status = 'closed' THEN 1 ELSE 0 END) AS closed,
+          SUM(CASE WHEN status = 'closed' AND ${AUTO_PNL_SQL} > 0 THEN 1 ELSE 0 END) AS wins,
+          COALESCE(SUM(CASE WHEN status = 'closed' THEN ${AUTO_PNL_SQL} END), 0) AS realized,
+          COALESCE(SUM(CASE WHEN status = 'closed' AND ${AUTO_PNL_SQL} > 0 THEN ${AUTO_PNL_SQL} END), 0) AS grossWin,
+          COALESCE(SUM(CASE WHEN status = 'closed' AND ${AUTO_PNL_SQL} < 0 THEN ${AUTO_PNL_SQL} END), 0) AS grossLoss
+        FROM trades WHERE auto = 1 GROUP BY strategy, variant ORDER BY realized DESC`).all();
+      return json(res, 200, { performance: rows });
     }
     if (p === '/api/activity' && req.method === 'GET') {
       return json(res, 200, { activity: db.prepare('SELECT * FROM activity ORDER BY id DESC LIMIT 100').all() });

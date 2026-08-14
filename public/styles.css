@@ -226,6 +226,16 @@ main.trades {
 .row-closed td { opacity: 0.62; }
 td.dim { color: var(--muted); }
 .btn.small { padding: 2px 8px; font-size: 12px; }
+
+#perf table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+#perf th {
+  text-align: right; font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px;
+  color: var(--muted); font-weight: 500; padding: 7px 10px;
+  border-bottom: 1px solid var(--hairline); position: sticky; top: 0; background: var(--surface);
+}
+#perf td { text-align: right; padding: 6px 10px; border-bottom: 1px solid var(--grid); color: var(--ink-2); }
+#perf th:first-child { text-align: left; }
+#perf .perf-total td { font-weight: 650; color: var(--ink); border-bottom: 1px solid var(--hairline); }
 input[type="text"], input[type="number"], select {
   background: var(--page); color: var(--ink);
   border: 1px solid var(--hairline); border-radius: 6px;
@@ -259,4 +269,14 @@ input:focus, select:focus { outline: 1px solid var(--accent); }
 .legend {
   background: var(--surface); border: 1px solid var(--hairline); border-radius: 8px;
   padding: 8px 12px; color: var(--ink-2); font-size: 12px; line-height: 1.9;
+}
+.legend-toggle {
+  display: block; background: none; border: none; padding: 0; cursor: pointer;
+  color: #9085e9; font: inherit; line-height: inherit;
+}
+.legend-toggle.off { color: var(--muted); text-decoration: line-through; }
+.plane-icon { background: none; border: none; }
+.plane-icon span {
+  display: inline-block; font-size: 15px; line-height: 18px; color: #9085e9;
+  text-shadow: 0 0 3px rgba(0, 0, 0, 0.9);
 }

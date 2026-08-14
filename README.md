@@ -24,6 +24,24 @@ Everything it does is written to the activity feed on the Trades page, and the
 Pause button stops entries/exits at any time. Paper account starts at $100,000
 (delete `data.db` to reset).
 
+## Strategy lab
+
+Each auto trade is tagged with its signal rule **and** an exit-style variant,
+assigned sample-balanced so every combination gets tested:
+
+| Variant | Stop | Target | Horizon |
+|---|---|---|---|
+| `tight` | 1.0× ADR | 1.5R | 0.6× rule horizon |
+| `base` | 1.5× ADR | 2R | 1× |
+| `runner` | 2.0× ADR | 3R | 1.5× |
+
+The **Strategy performance** tab on the Trades page shows win rate, realized
+P&L, and profit factor per combination. Sizing adapts to results: a combo
+that's net-negative after 5 closed trades runs at half size; after 10 it is
+paused (`base` variants drop to quarter-size probes instead of pausing, so a
+strategy can earn its way back). Winners keep full size. Over time the book
+concentrates in whatever actually works.
+
 ## Run it
 
 ```
@@ -31,6 +49,21 @@ start.cmd
 ```
 
 (or `C:\Users\colin\tools\node\node.exe server.mjs`) then open <http://localhost:3555>.
+
+To have it start automatically (minimized) at every login, run
+`autostart-install.cmd` once (`autostart-remove.cmd` undoes it — edit the
+Node path inside if yours differs).
+
+## Monitoring
+
+- **Equity sparkline** on the Account equity tile (snapshotted every 10 min).
+- **Strategy performance tab** — win rate / realized P&L / profit factor per
+  strategy×variant, plus a combined row for the whole autopilot book.
+- **Autopilot activity feed** — every plan, entry, exit, skip, and sizing
+  adjustment, with reasons.
+- **Export CSV** button on the blotter for analysis elsewhere.
+- **Map garnish**: live military aircraft from adsb.lol's open API (toggle in
+  the map legend), alongside the event markers.
 
 ## Pages
 

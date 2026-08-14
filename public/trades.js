@@ -58,6 +58,7 @@ function planRow(s) {
     return el('div', { class: 'plan-meta' }, 'pricing plan… (next engine tick)');
   }
   const risk = Math.abs(s.plan_entry - s.plan_stop) * s.plan_qty;
+  const rMult = Math.abs(s.plan_target - s.plan_entry) / (Math.abs(s.plan_entry - s.plan_stop) || 1);
   const exitBy = new Date(Date.now() + s.horizon_days * 86400000).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
   return el('div', {},
     el('div', { class: 'plan-row' },
@@ -66,7 +67,7 @@ function planRow(s) {
       el('div', { class: 'kv' }, el('span', {}, 'Target'), el('b', { class: 'target' }, fmtPrice(s.plan_target))),
       el('div', { class: 'kv' }, el('span', {}, 'Size'), el('b', {}, s.plan_qty)),
     ),
-    el('div', { class: 'plan-meta' }, `risk ~$${risk.toFixed(0)} for 2R reward · auto-exit by ${exitBy} or at stop/target`),
+    el('div', { class: 'plan-meta' }, `risk ~$${risk.toFixed(0)} for ${rMult.toFixed(1)}R reward · auto-exit by ${exitBy} or at stop/target`),
   );
 }
 
@@ -168,11 +169,40 @@ function tile(label, value, polarity, sub, extra) {
 
 const moneyFmt = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
 
+// Tiny single-series equity sparkline for the equity tile.
+function sparkline(points, w = 150, h = 34) {
+  if (!points || points.length < 2) return null;
+  const xs = points.map((p) => p.ts);
+  const ys = points.map((p) => p.equity);
+  const minX = Math.min(...xs), maxX = Math.max(...xs);
+  const minY = Math.min(...ys), maxY = Math.max(...ys);
+  const spanX = (maxX - minX) || 1;
+  const spanY = (maxY - minY) || 1;
+  const pts = points.map((p) =>
+    `${(((p.ts - minX) / spanX) * w).toFixed(1)},${(h - 3 - ((p.equity - minY) / spanY) * (h - 6)).toFixed(1)}`).join(' ');
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('width', w); svg.setAttribute('height', h);
+  svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+  svg.setAttribute('aria-label', 'equity history');
+  const poly = document.createElementNS('http://www.w3.org/2000/svg', 'polyline');
+  poly.setAttribute('points', pts);
+  poly.setAttribute('fill', 'none');
+  poly.setAttribute('stroke', 'var(--accent)');
+  poly.setAttribute('stroke-width', '2');
+  poly.setAttribute('stroke-linejoin', 'round');
+  poly.setAttribute('stroke-linecap', 'round');
+  svg.append(poly);
+  return svg;
+}
+
+let equityHistory = [];
+
 function renderTiles(summary) {
   const tiles = document.getElementById('tiles');
   const dayDelta = summary.equity - summary.startingEquity;
   tiles.replaceChildren(
-    tile('Account equity', moneyFmt.format(summary.equity), null, `${fmtPnl(dayDelta)} all-time`),
+    tile('Account equity', moneyFmt.format(summary.equity), null, `${fmtPnl(dayDelta)} all-time`, sparkline(equityHistory)),
+    tile("Claude's P&L", fmtPnl(summary.claudePnl), summary.claudePnl, `${summary.claudeCount} autopilot trade${summary.claudeCount === 1 ? '' : 's'}`),
     tile('Unrealized P&L', fmtPnl(summary.unrealized), summary.unrealized, `${summary.openCount} open position${summary.openCount === 1 ? '' : 's'}`),
     tile('Realized P&L', fmtPnl(summary.realized), summary.realized, `${summary.closedCount} closed`),
     tile('Win rate', summary.winRate == null ? '—' : `${Math.round(summary.winRate * 100)}%`, null, 'of closed trades'),
@@ -203,13 +233,14 @@ function renderBlotter(data) {
   }
   const table = el('table', {},
     el('thead', {}, el('tr', {},
-      ...['Symbol', '', 'Side', 'Qty', 'Entry', 'Stop', 'Target', 'Mark/Exit', 'P&L', 'Opened', 'Exit', ''].map((h) => el('th', {}, h)))),
+      ...['Symbol', '', 'Strategy', 'Side', 'Qty', 'Entry', 'Stop', 'Target', 'Mark/Exit', 'P&L', 'Opened', 'Exit', ''].map((h) => el('th', {}, h)))),
   );
   const tbody = el('tbody');
   for (const t of trades) {
     tbody.append(el('tr', { class: t.status === 'closed' ? 'row-closed' : '' },
       el('td', { class: 'sym', style: 'cursor:pointer', onclick: () => loadChart(t.symbol) }, t.symbol),
       el('td', { style: 'text-align:left' }, t.auto ? el('span', { class: 'chip auto', title: 'opened by autopilot' }, 'auto') : null),
+      el('td', { class: 'dim', style: 'text-align:left' }, t.auto ? `${t.strategy || ''} · ${t.variant || ''}` : 'manual'),
       el('td', {}, t.side),
       el('td', {}, t.qty),
       el('td', {}, fmtPrice(t.entry_price)),
@@ -236,6 +267,48 @@ function renderBlotter(data) {
   box.append(table);
 }
 
+// ---- strategy performance ----
+function renderPerformance(rows) {
+  const box = document.getElementById('perf');
+  box.replaceChildren();
+  if (!rows.length) {
+    box.append(el('div', { class: 'empty' }, 'No autopilot trades yet — per-strategy results appear here as trades close.'));
+    return;
+  }
+  const totals = rows.reduce((a, r) => ({
+    total: a.total + r.total, open: a.open + r.open, closed: a.closed + r.closed,
+    wins: a.wins + r.wins, realized: a.realized + r.realized,
+    grossWin: a.grossWin + r.grossWin, grossLoss: a.grossLoss + r.grossLoss,
+  }), { total: 0, open: 0, closed: 0, wins: 0, realized: 0, grossWin: 0, grossLoss: 0 });
+  const pf = (r) => (r.grossLoss < 0 ? (r.grossWin / -r.grossLoss).toFixed(2) : (r.grossWin > 0 ? '∞' : '—'));
+  const winPct = (r) => (r.closed ? `${Math.round((r.wins / r.closed) * 100)}%` : '—');
+  const row = (r, label, cls = '') => el('tr', { class: cls },
+    el('td', { style: 'text-align:left' }, label),
+    el('td', {}, `${r.total}${r.open ? ` (${r.open} open)` : ''}`),
+    el('td', {}, winPct(r)),
+    el('td', { class: r.realized > 0 ? 'pnl-up' : r.realized < 0 ? 'pnl-down' : '' }, fmtPnl(r.realized)),
+    el('td', {}, pf(r)),
+  );
+  const table = el('table', {},
+    el('thead', {}, el('tr', {}, ...['Strategy · variant', 'Trades', 'Win %', 'Realized P&L', 'Profit factor'].map((h) => el('th', {}, h)))),
+    el('tbody', {},
+      row(totals, 'ALL — Claude combined', 'perf-total'),
+      ...rows.map((r) => row(r, `${r.strategy} · ${r.variant}`)),
+    ),
+  );
+  box.append(table);
+  box.append(el('div', { class: 'note' }, 'Sizing adapts automatically: a combo that is net-negative after 5 closed trades runs at half size, after 10 it is paused (base variants drop to quarter-size probes instead). Winners keep full size.'));
+}
+
+document.getElementById('tab-trades').addEventListener('click', () => showBlotterTab('trades'));
+document.getElementById('tab-perf').addEventListener('click', () => showBlotterTab('perf'));
+function showBlotterTab(which) {
+  document.getElementById('blotter').hidden = which !== 'trades';
+  document.getElementById('perf').hidden = which !== 'perf';
+  document.getElementById('tab-trades').classList.toggle('active', which === 'trades');
+  document.getElementById('tab-perf').classList.toggle('active', which === 'perf');
+}
+
 // ---- activity feed ----
 const KIND_ICON = { open: '▶', close: '■', plan: '◇', skip: '⏭', info: '·' };
 function renderActivity(items) {
@@ -257,10 +330,12 @@ function renderActivity(items) {
 // ---- load loop ----
 async function loadAll() {
   try {
-    const [trades, activity] = await Promise.all([api('/api/trades'), api('/api/activity')]);
+    const [trades, activity, perf, eq] = await Promise.all([api('/api/trades'), api('/api/activity'), api('/api/performance'), api('/api/equity-history')]);
+    equityHistory = eq.history;
     renderTiles(trades.summary);
     renderBlotter(trades);
     renderActivity(activity.activity);
+    renderPerformance(perf.performance);
   } catch (err) {
     setStatus(`Load failed: ${err.message}`);
   }

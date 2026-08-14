@@ -8,6 +8,7 @@ L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
   subdomains: 'abcd', maxZoom: 12,
 }).addTo(map);
 
+let flightsOn = true;
 const legend = L.control({ position: 'bottomleft' });
 legend.onAdd = () => {
   const div = document.createElement('div');
@@ -15,13 +16,59 @@ legend.onAdd = () => {
   for (const [kind, label] of [['unrest', 'Unrest / conflict'], ['quake', 'Earthquake'], ['natural', 'Natural event']]) {
     div.append(el('div', {}, el('span', { class: `dot ${kind}` }), label));
   }
+  div.append(el('button', {
+    class: 'legend-toggle', id: 'flights-toggle',
+    onclick: () => {
+      flightsOn = !flightsOn;
+      if (!flightsOn) flightLayer.clearLayers();
+      else refreshFlights();
+      updateFlightsToggle(null);
+    },
+  }, '✈ military flights'));
   div.append(el('div', { style: 'color: var(--muted)' }, 'marker size = severity'));
+  L.DomEvent.disableClickPropagation(div);
   return div;
 };
 legend.addTo(map);
 
+function updateFlightsToggle(count) {
+  const btn = document.getElementById('flights-toggle');
+  if (!btn) return;
+  btn.classList.toggle('off', !flightsOn);
+  btn.textContent = flightsOn ? `✈ military flights${count != null ? ` (${count})` : ''}` : '✈ military flights — off';
+}
+
 const markerLayer = L.layerGroup().addTo(map);
 const markerById = new Map();
+const flightLayer = L.layerGroup().addTo(map);
+
+// U+2708 points ~45° right of north in most fonts, hence the -45 offset.
+function planeIcon(track) {
+  return L.divIcon({
+    className: 'plane-icon',
+    html: `<span style="transform: rotate(${Math.round(track - 45)}deg)">✈</span>`,
+    iconSize: [18, 18], iconAnchor: [9, 9],
+  });
+}
+
+async function refreshFlights() {
+  if (!flightsOn) return;
+  try {
+    const d = await api('/api/flights');
+    if (!flightsOn) return; // toggled off while fetching
+    flightLayer.clearLayers();
+    for (const f of d.flights) {
+      const m = L.marker([f.lat, f.lon], { icon: planeIcon(f.track), keyboard: false });
+      m.bindPopup(el('div', {},
+        el('div', { style: 'font-weight:600' }, `✈ ${f.callsign}`),
+        el('div', { class: 'm' }, [f.type, f.reg, f.alt != null ? `${f.alt.toLocaleString()} ft` : null, f.speed != null ? `${f.speed} kt` : null].filter(Boolean).join(' · ')),
+        el('div', { class: 'm' }, 'military · live via adsb.lol'),
+      ));
+      m.addTo(flightLayer);
+    }
+    updateFlightsToggle(d.flights.length);
+  } catch { /* keep last markers; retry next cycle */ }
+}
 
 function popupContent(e) {
   const wrap = el('div', {},
@@ -140,4 +187,6 @@ async function refresh() {
 }
 
 refresh();
+refreshFlights();
 setInterval(refresh, 60 * 1000);
+setInterval(refreshFlights, 60 * 1000);
