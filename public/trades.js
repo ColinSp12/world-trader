@@ -1,4 +1,4 @@
-import { el, api, timeAgo, fmtPnl, fmtPrice, safeUrl, renderTradeLogList } from '/shared.js';
+import { el, api, timeAgo, fmtPnl, fmtPrice, safeUrl, renderTradeLogList, famDot } from '/shared.js';
 
 let currentSymbol = 'USO';
 let signalsCache = [];
@@ -238,6 +238,43 @@ function tile(label, value, polarity, sub, extra) {
 
 const moneyFmt = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
 
+// Count-up animation: tiles glide to their new value instead of snapping.
+function animateValue(node, from, to, fmt) {
+  if (!Number.isFinite(from) || from === to) { node.textContent = fmt(to); return; }
+  const t0 = performance.now();
+  const dur = 500;
+  const step = (t) => {
+    const k = Math.min(1, (t - t0) / dur);
+    node.textContent = fmt(from + (to - from) * (1 - Math.pow(1 - k, 3)));
+    if (k < 1) requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
+const prevTileVals = {};
+
+// Tiny SVG donut for the win-rate tile.
+function winRing(rate) {
+  const NS = 'http://www.w3.org/2000/svg';
+  const mk = (tag, attrs) => {
+    const n = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, v);
+    return n;
+  };
+  const r = 16, c = 2 * Math.PI * r;
+  const svg = mk('svg', { width: 40, height: 40, viewBox: '0 0 40 40', class: 'win-ring' });
+  svg.append(mk('circle', { cx: 20, cy: 20, r, fill: 'none', stroke: 'var(--grid)', 'stroke-width': 5 }));
+  if (rate != null) {
+    svg.append(mk('circle', {
+      cx: 20, cy: 20, r, fill: 'none',
+      stroke: rate >= 0.5 ? 'var(--up)' : 'var(--down)', 'stroke-width': 5,
+      'stroke-linecap': 'round',
+      'stroke-dasharray': `${(rate * c).toFixed(1)} ${c.toFixed(1)}`,
+      transform: 'rotate(-90 20 20)',
+    }));
+  }
+  return svg;
+}
+
 // Tiny single-series equity sparkline for the equity tile.
 function sparkline(points, w = 150, h = 34) {
   if (!points || points.length < 2) return null;
@@ -269,12 +306,19 @@ let equityHistory = [];
 function renderTiles(summary) {
   const tiles = document.getElementById('tiles');
   const dayDelta = summary.equity - summary.startingEquity;
+  document.title = `World Trader · ${moneyFmt.format(summary.equity)}`;
   tiles.replaceChildren(
     tile('Account equity', moneyFmt.format(summary.equity), null, `${fmtPnl(dayDelta)} all-time`, sparkline(equityHistory)),
     tile("Claude's P&L", fmtPnl(summary.claudePnl), summary.claudePnl, `${summary.claudeCount} autopilot trade${summary.claudeCount === 1 ? '' : 's'}`),
     tile('Unrealized P&L', fmtPnl(summary.unrealized), summary.unrealized, `${summary.openCount} open position${summary.openCount === 1 ? '' : 's'}`),
     tile('Realized P&L', fmtPnl(summary.realized), summary.realized, `${summary.closedCount} closed`),
-    tile('Win rate', summary.winRate == null ? '—' : `${Math.round(summary.winRate * 100)}%`, null, 'of closed trades'),
+    el('div', { class: 'tile tile-ring' },
+      el('div', {},
+        el('div', { class: 'label' }, 'Win rate'),
+        el('div', { class: 'value' }, summary.winRate == null ? '—' : `${Math.round(summary.winRate * 100)}%`),
+        el('div', { class: 'sub' }, 'of closed trades'),
+      ),
+      winRing(summary.winRate)),
     tile('Autopilot', summary.autopilot ? 'ON' : 'PAUSED', summary.autopilot ? 1 : -1, 'opens & exits trades',
       el('button', {
         class: 'btn', style: 'margin-top:6px',
@@ -285,6 +329,18 @@ function renderTiles(summary) {
         },
       }, summary.autopilot ? 'Pause' : 'Resume')),
   );
+  // glide the money tiles to their new values
+  const vals = tiles.querySelectorAll('.tile .value');
+  const targets = [
+    ['equity', summary.equity, (v) => moneyFmt.format(v), vals[0]],
+    ['claude', summary.claudePnl, fmtPnl, vals[1]],
+    ['unreal', summary.unrealized, fmtPnl, vals[2]],
+    ['real', summary.realized, fmtPnl, vals[3]],
+  ];
+  for (const [key, to, fmt, node] of targets) {
+    if (node) animateValue(node, prevTileVals[key], to, fmt);
+    prevTileVals[key] = to;
+  }
 }
 
 // ---- blotter ----
@@ -325,7 +381,7 @@ function renderBlotter(data) {
     tbody.append(el('tr', { class: t.status === 'closed' ? 'row-closed' : '' },
       el('td', { class: 'sym', style: 'cursor:pointer', onclick: () => loadChart(t.symbol) }, t.symbol),
       el('td', { style: 'text-align:left' }, t.auto ? el('span', { class: 'chip auto', title: 'opened by autopilot' }, 'auto') : null),
-      el('td', { class: 'dim', style: 'text-align:left' }, t.auto ? `${t.strategy || ''} · ${t.variant || ''}` : 'manual'),
+      el('td', { class: 'dim', style: 'text-align:left' }, famDot(t.strategy), t.auto ? `${t.strategy || ''} · ${t.variant || ''}` : 'manual'),
       el('td', {}, t.side),
       el('td', {}, t.qty),
       el('td', {}, fmtPrice(t.entry_price)),
@@ -514,8 +570,14 @@ async function loadAll() {
 // ---- live stream: prices tick in real time, fills refresh instantly ----
 const LIVE_SYMS = ['BTC-USD', 'ETH-USD', 'SOL-USD', 'XRP-USD', 'DOGE-USD', 'LTC-USD'];
 const liveEls = new Map();
+function usMarketOpen() {
+  const et = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  const mins = et.getHours() * 60 + et.getMinutes();
+  return et.getDay() >= 1 && et.getDay() <= 5 && mins >= 570 && mins < 960; // 9:30–16:00 ET
+}
 {
   const bar = document.getElementById('livebar');
+  bar.append(el('span', { class: 'live-dot', id: 'stream-dot', title: 'streaming' }));
   for (const sym of LIVE_SYMS) {
     const px = el('span', { class: 'lp-px' }, '—');
     bar.append(el('button', {
@@ -523,12 +585,28 @@ const liveEls = new Map();
     }, el('span', { class: 'lp-sym' }, sym.replace('-USD', '')), px));
     liveEls.set(sym, { px, last: null });
   }
+  const mkt = el('span', { class: 'mkt-chip', id: 'mkt-chip' });
+  bar.append(el('span', { style: 'flex:1' }), mkt);
+  const updateMkt = () => {
+    const open = usMarketOpen();
+    mkt.textContent = `US equities ${open ? 'OPEN' : 'CLOSED'} · crypto 24/7`;
+    mkt.classList.toggle('open', open);
+  };
+  updateMkt();
+  setInterval(updateMkt, 60 * 1000);
+}
+
+function setStreamHealth(alive) {
+  for (const d of document.querySelectorAll('.live-dot')) d.classList.toggle('dead', !alive);
 }
 
 let fillRefreshTimer = null;
 function connectStream() {
   const es = new EventSource('/api/stream');
+  es.onopen = () => setStreamHealth(true);
+  es.onerror = () => setStreamHealth(false);
   es.onmessage = (ev) => {
+    setStreamHealth(true);
     let d;
     try { d = JSON.parse(ev.data); } catch { return; }
     if (d.type === 'prices') {
@@ -550,7 +628,7 @@ function connectStream() {
       fillRefreshTimer = setTimeout(loadAll, 1200);
     }
   };
-  // EventSource reconnects automatically on error
+  // EventSource reconnects automatically after errors
 }
 connectStream();
 

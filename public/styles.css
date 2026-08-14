@@ -17,7 +17,11 @@
   --warn: #fab219;
 }
 
-* { box-sizing: border-box; }
+* { box-sizing: border-box; scrollbar-width: thin; scrollbar-color: var(--grid) transparent; }
+*::-webkit-scrollbar { width: 8px; height: 8px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb { background: var(--grid); border-radius: 4px; }
+*::-webkit-scrollbar-thumb:hover { background: var(--muted); }
 html, body { height: 100%; }
 body {
   margin: 0;
@@ -152,7 +156,9 @@ main.trades {
 .tiles { grid-column: 1 / 3; display: flex; gap: 12px; flex-wrap: wrap; }
 .tile {
   flex: 1; min-width: 150px;
-  background: var(--surface); border: 1px solid var(--hairline); border-radius: 8px;
+  background: linear-gradient(180deg, #1e1e1d, var(--surface));
+  border: 1px solid var(--hairline); border-radius: 8px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
   padding: 10px 14px;
 }
 .tile .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); }
@@ -162,9 +168,12 @@ main.trades {
 .tile .sub { font-size: 11.5px; color: var(--muted); }
 
 .panel {
-  background: var(--surface); border: 1px solid var(--hairline); border-radius: 8px;
+  background: linear-gradient(180deg, #1e1e1d, var(--surface) 46px);
+  border: 1px solid var(--hairline); border-radius: 8px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
   display: flex; flex-direction: column; min-height: 0; overflow: hidden;
 }
+.panel > h2 { display: flex; align-items: center; gap: 8px; }
 .panel > h2 {
   font-size: 12px; text-transform: uppercase; letter-spacing: 0.6px;
   color: var(--muted); margin: 0; padding: 10px 14px;
@@ -279,6 +288,39 @@ dialog h3 { margin: 0 0 4px; font-size: 15px; }
 .equity-wrap { padding: 10px 14px 0; }
 .equity-chart { width: 100%; height: auto; display: block; }
 
+/* live/status indicators */
+.live-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--up); display: inline-block; flex: none;
+  animation: livepulse 2.2s ease-out infinite;
+}
+.live-dot.dead { background: var(--down); animation: none; }
+@keyframes livepulse {
+  0% { box-shadow: 0 0 0 0 rgba(12, 163, 12, 0.55); }
+  70% { box-shadow: 0 0 0 6px rgba(12, 163, 12, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(12, 163, 12, 0); }
+}
+.mkt-chip { color: var(--muted); font-size: 11px; white-space: nowrap; padding-right: 4px; }
+.mkt-chip.open { color: var(--up); }
+
+/* strategy family identity dots */
+.fam-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 5px; vertical-align: 1px; flex: none; }
+.fam-event { background: var(--accent); }
+.fam-tech { background: var(--cat-unrest); }
+.fam-hyper { background: #9085e9; }
+.fam-manual { background: var(--muted); }
+
+/* fresh fills flash as they land */
+.log-row.fresh { animation: fill-flash 1.8s ease-out; }
+@keyframes fill-flash {
+  0% { background: rgba(57, 135, 229, 0.22); }
+  100% { background: transparent; }
+}
+
+/* win-rate donut tile */
+.tile-ring { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.win-ring { flex: none; }
+
 /* live price strip */
 .livebar {
   display: flex; gap: 4px; align-items: center;
@@ -339,8 +381,11 @@ main.strategies { flex: 1; overflow-y: auto; padding: 16px; }
 .balance-curve { width: 100%; height: auto; display: block; }
 .strategy-card .stats { color: var(--ink-2); font-size: 12px; }
 .strategy-card .desc { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
-.strategy-card.clickable { cursor: pointer; transition: border-color 0.15s; }
-.strategy-card.clickable:hover { border-color: var(--muted); }
+.strategy-card.clickable { cursor: pointer; transition: border-color 0.15s, transform 0.15s; }
+.strategy-card.clickable:hover { border-color: var(--muted); transform: translateY(-1px); }
+.strategy-card.fam-border-event { border-left: 3px solid var(--accent); }
+.strategy-card.fam-border-tech { border-left: 3px solid var(--cat-unrest); }
+.strategy-card.fam-border-hyper { border-left: 3px solid #9085e9; }
 
 /* strategy detail view */
 .detail-layout {

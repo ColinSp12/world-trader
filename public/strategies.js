@@ -35,7 +35,7 @@ function balanceCurve(curve, base, w = 300, h = 84) {
 
 function card(a, base) {
   const delta = a.balance - base;
-  return el('div', { class: 'strategy-card clickable', onclick: () => { location.hash = a.rule; } },
+  return el('div', { class: `strategy-card clickable fam-border-${a.family}`, onclick: () => { location.hash = a.rule; } },
     el('div', { class: 'head' },
       el('h3', {}, a.title),
       a.watchOnly ? el('span', { class: 'chip' }, 'watch-only') : el('span', { class: 'chip auto' }, 'auto-trades'),

@@ -60,8 +60,21 @@ export function fmtPrice(v) {
 export const KIND_LABEL = { unrest: 'Unrest', conflict: 'Conflict', quake: 'Earthquake', natural: 'Natural' };
 export const SEV_LABEL = ['info', 'minor', 'major', 'severe'];
 
+// Strategy family identity — one color per family, used everywhere a
+// strategy is named so the eye learns who did what.
+export const RULE_FAMILY = {
+  'oil-producer-unrest': 'event', 'chokepoint-disruption': 'event', 'chokepoint-transit-drop': 'event',
+  'quake-country-etf': 'event', 'hurricane-energy': 'event', 'global-risk-off': 'event', 'headline-risk': 'event',
+  'ma-cross': 'tech', 'rsi-reversal': 'tech', 'breakout-20': 'tech',
+  'momo-scalper': 'hyper',
+};
+export function famDot(strategy) {
+  return el('span', { class: `fam-dot fam-${RULE_FAMILY[strategy] || 'manual'}`, title: RULE_FAMILY[strategy] || 'manual' });
+}
+
 // Broker-style fill log: green buys, red sells, signed P&L on every exit.
 // Shared by the Trades page log and the per-strategy detail view.
+const lastNewestByBox = new WeakMap(); // per-container newest-fill marker for flash-on-arrival
 export function renderTradeLogList(box, trades, cap = 250) {
   box.replaceChildren();
   const qtyFmt = (q) => (Number.isInteger(q) ? q : Number(q.toFixed(4)));
@@ -72,6 +85,7 @@ export function renderTradeLogList(box, trades, cap = 250) {
       buy: t.side === 'long',
       label: `${t.side === 'long' ? 'BUY' : 'SELL SHORT'} ${qtyFmt(t.qty)} ${t.symbol} @ ${fmtPrice(t.entry_price)}`,
       tag: t.auto ? `${t.strategy || ''}` : 'manual',
+      strategy: t.strategy,
     });
     if (t.status === 'closed') {
       const pct = t.entry_price * t.qty ? (t.pnl / (t.entry_price * t.qty)) * 100 : null;
@@ -81,6 +95,7 @@ export function renderTradeLogList(box, trades, cap = 250) {
         label: `${t.side === 'long' ? 'SELL' : 'BUY TO COVER'} ${qtyFmt(t.qty)} ${t.symbol} @ ${fmtPrice(t.exit_price)}`,
         pnl: t.pnl, pct,
         tag: t.exit_reason || 'closed',
+        strategy: t.strategy,
       });
     }
   }
@@ -89,8 +104,10 @@ export function renderTradeLogList(box, trades, cap = 250) {
     return;
   }
   events.sort((a, b) => b.ts - a.ts);
+  const prevNewest = lastNewestByBox.get(box) ?? Infinity; // first render: nothing flashes
+  lastNewestByBox.set(box, events[0].ts);
   for (const ev of events.slice(0, cap)) {
-    box.append(el('div', { class: `log-row ${ev.buy ? 'buy' : 'sell'}` },
+    box.append(el('div', { class: `log-row ${ev.buy ? 'buy' : 'sell'}${ev.ts > prevNewest ? ' fresh' : ''}` },
       el('span', { class: 'log-arrow' }, ev.buy ? '▲' : '▼'),
       el('span', { class: 'log-main' },
         el('span', { class: 'log-label' }, ev.label),
@@ -98,7 +115,7 @@ export function renderTradeLogList(box, trades, cap = 250) {
           ? el('span', { class: `log-pnl ${ev.pnl >= 0 ? 'pnl-up' : 'pnl-down'}` },
               `${fmtPnl(ev.pnl)}${Number.isFinite(ev.pct) ? ` (${ev.pct >= 0 ? '+' : ''}${ev.pct.toFixed(2)}%)` : ''}`)
           : null,
-        el('span', { class: 'log-meta' }, `${ev.tag} · ${timeAgo(ev.ts)}`),
+        el('span', { class: 'log-meta' }, famDot(ev.strategy), `${ev.tag} · ${timeAgo(ev.ts)}`),
       ),
     ));
   }
