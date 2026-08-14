@@ -252,6 +252,11 @@ async function strategyTrades(rule) {
 }
 
 async function renderDetail(a, base) {
+  // Await points below can resolve after the user navigated away — a stale
+  // render must never clobber the grid (or another strategy's detail).
+  const stillWanted = () => {
+    try { return decodeURIComponent(location.hash.slice(1)) === a.rule; } catch { return false; }
+  };
   const grid = document.getElementById('grid');
   const delta = a.balance - base;
   const tile = (label, value, cls = '') => el('div', { class: 'tile' },
@@ -349,6 +354,7 @@ async function renderDetail(a, base) {
   const myLog = (evoCache?.log || []).filter((l) => l.message.includes(a.rule)).slice(0, 12);
   if (myLog.length) mainCol.append(learningLog(myLog, `🧠 Learning log — ${a.title}`));
 
+  if (!stillWanted()) return; // user navigated away while daily-pnl was in flight
   const tapeBox = el('div', { class: 'scroll' });
   const tape = el('section', { class: 'panel detail-tape' },
     el('h2', {}, 'Live fills'),
@@ -358,6 +364,7 @@ async function renderDetail(a, base) {
 
   try {
     const trades = await strategyTrades(a.rule);
+    if (!stillWanted()) return;
     // flashKey keeps new-fill flashes working across re-renders (the tape box
     // element is recreated every render, so a WeakMap key would never match).
     renderTradeLogList(tapeBox, trades, 200, `tape-${a.rule}`);

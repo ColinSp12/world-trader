@@ -64,14 +64,18 @@ legend.onAdd = () => {
   div.append(simpleToggle('fx-toggle', '✨ signal glow', () => fxOn, () => {
     fxOn = !fxOn;
     setPref('wt-map-fx', fxOn);
-    if (!fxOn) fxLayer.clearLayers();
-    else renderAmbience(signalsCache);
+    renderAmbience(signalsCache); // handles both clear-on-off and rebuild-on-on
   }));
   div.append(el('div', { style: 'color: var(--muted)' }, 'marker size = severity'));
   L.DomEvent.disableClickPropagation(div);
   return div;
 };
 legend.addTo(map);
+// Sync the aircraft/ships buttons with their persisted state — created
+// without the off class, and their refreshers early-return when off, so
+// nothing else would ever paint the off style after a reload.
+updateFlightsToggle(null);
+updateShipsToggle(null);
 
 function updateFlightsToggle(counts) {
   const btn = document.getElementById('flights-toggle');
@@ -230,33 +234,51 @@ function glowPopup(s) {
     el('div', { class: 'm' }, el('a', { href: `/trades?signal=${encodeURIComponent(s.id)}` }, 'Open in Trades →')));
 }
 
+// Diff-keyed by signal id — a glow popup someone is reading must survive the
+// 60s refresh (same treatment the event markers already get).
+const fxById = new Map(); // signal id -> [layers]
 function renderAmbience(signals) {
-  fxLayer.clearLayers();
-  if (!fxOn) return;
-  const active = signals.filter((s) => s.status === 'new' || s.status === 'taken');
-  for (const s of active.slice(0, 20)) {
+  if (!fxOn) { fxLayer.clearLayers(); fxById.clear(); return; }
+  const active = signals.filter((s) => s.status === 'new' || s.status === 'taken').slice(0, 20);
+  const seen = new Set();
+  for (const s of active) {
+    seen.add(s.id);
+    const existing = fxById.get(s.id);
+    if (existing) {
+      // Refresh popup content in place (status may flip new → taken).
+      for (const layer of existing) layer.getPopup?.()?.setContent(glowPopup(s));
+      continue;
+    }
+    const layers = [];
     const ev = s.event;
     // pulsing ring around a chokepoint named in a transit-drop signal
     if (s.rule === 'chokepoint-transit-drop') {
       const cp = CHOKEPOINTS.find((c) => s.headline.includes(c.name));
       if (cp) {
-        L.marker([cp.lat, cp.lon], {
+        layers.push(L.marker([cp.lat, cp.lon], {
           icon: L.divIcon({ className: 'glow-icon', html: '<span class="glow choke"></span>', iconSize: [70, 70], iconAnchor: [35, 35] }),
           keyboard: false,
-        }).bindPopup(glowPopup(s)).addTo(fxLayer);
+        }).bindPopup(glowPopup(s)).addTo(fxLayer));
       }
+      fxById.set(s.id, layers);
       continue;
     }
-    if (!ev || !Number.isFinite(ev.lat) || !Number.isFinite(ev.lon)) continue;
-    L.marker([ev.lat, ev.lon], {
+    if (!ev || !Number.isFinite(ev.lat) || !Number.isFinite(ev.lon)) { fxById.set(s.id, layers); continue; }
+    layers.push(L.marker([ev.lat, ev.lon], {
       icon: L.divIcon({ className: 'glow-icon', html: '<span class="glow"></span>', iconSize: [90, 90], iconAnchor: [45, 45] }),
       keyboard: false,
-    }).bindPopup(glowPopup(s)).addTo(fxLayer);
+    }).bindPopup(glowPopup(s)).addTo(fxLayer));
     // arc to the nearest chokepoint for shipping/oil-flavored signals
     if (s.rule === 'chokepoint-disruption' || s.rule === 'oil-producer-unrest') {
       const cp = nearestChokepoint(ev.lat, ev.lon);
-      if (cp) arcLine([ev.lat, ev.lon], [cp.lat, cp.lon]).addTo(fxLayer);
+      if (cp) layers.push(arcLine([ev.lat, ev.lon], [cp.lat, cp.lon]).addTo(fxLayer));
     }
+    fxById.set(s.id, layers);
+  }
+  for (const [id, layers] of fxById) {
+    if (seen.has(id)) continue;
+    for (const l of layers) fxLayer.removeLayer(l);
+    fxById.delete(id);
   }
 }
 
@@ -370,7 +392,6 @@ function popupContent(e) {
 const ringById = new Map();
 function renderMarkers(events) {
   const seen = new Set();
-  let rings = ringById.size;
   for (const e of events) {
     seen.add(e.id);
     let marker = markerById.get(e.id);
@@ -385,16 +406,6 @@ function renderMarkers(events) {
       marker.bindPopup(() => popupContent(marker.__event)); // resolved at open time
       marker.addTo(markerLayer);
       markerById.set(e.id, marker);
-      // severe events get an animated pulse ring (capped — each one is a
-      // perpetually-animating DOM node)
-      if (e.severity >= 3 && rings < 15) {
-        const ring = L.marker([e.lat, e.lon], {
-          icon: L.divIcon({ className: 'pulse-icon', html: `<span class="pulse-ring ${e.kind}"></span>`, iconSize: [36, 36], iconAnchor: [18, 18] }),
-          interactive: false, keyboard: false,
-        }).addTo(markerLayer);
-        ringById.set(e.id, ring);
-        rings++;
-      }
     }
     marker.__event = e;
   }
@@ -404,6 +415,20 @@ function renderMarkers(events) {
     markerById.delete(id);
     const r = ringById.get(id);
     if (r) { markerLayer.removeLayer(r); ringById.delete(id); }
+  }
+  // Pulse rings AFTER removal so freed slots go to severe events that were
+  // previously denied one (and to events whose severity escalated). Capped —
+  // each ring is a perpetually-animating DOM node.
+  for (const [id, m] of markerById) {
+    if (ringById.size >= 15) break;
+    const e = m.__event;
+    if (e.severity >= 3 && !ringById.has(id)) {
+      const ring = L.marker([e.lat, e.lon], {
+        icon: L.divIcon({ className: 'pulse-icon', html: `<span class="pulse-ring ${e.kind}"></span>`, iconSize: [36, 36], iconAnchor: [18, 18] }),
+        interactive: false, keyboard: false,
+      }).addTo(markerLayer);
+      ringById.set(id, ring);
+    }
   }
 }
 

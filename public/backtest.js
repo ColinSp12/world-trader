@@ -76,7 +76,7 @@ function renderResults(r) {
     const tiles = el('div', { class: 'bt-tiles' },
       statTile('Trades', String(x.trades)),
       statTile('Win rate', x.winRate != null ? `${Math.round(x.winRate * 100)}% (n=${x.trades})` : '—'),
-      statTile('Profit factor', x.profitFactor != null ? (x.profitFactor === null ? '—' : Number(x.profitFactor).toFixed(2)) : '—'),
+      statTile('Profit factor', x.profitFactor === 'inf' ? '∞' : Number.isFinite(x.profitFactor) ? Number(x.profitFactor).toFixed(2) : '—'),
       statTile('Max drawdown', fmtMoney(Math.abs(x.maxDrawdown || 0)), 'pnl-down'),
       statTile('Costs paid', fmtMoney(x.frictionPaid || 0)),
       statTile('Avg hold', fmtHold(x.avgHoldDays)),
@@ -92,7 +92,7 @@ function renderResults(r) {
         side: t.side, qty: t.qty, symbol: t.symbol,
         entry_price: t.entry, exit_price: t.exit,
         pnl: t.pnl, exit_reason: t.reason, strategy: rule, auto: 1,
-      })), 400);
+      })), x.tradeLog.length * 2); // two fill events (entry + exit) per trade
       det.append(logBox);
       card.append(det);
     }

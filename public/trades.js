@@ -21,6 +21,13 @@ function renderUnlessHovered(id, fn) {
   if (hoverPause.has(id)) pendingRender.set(id, fn);
   else fn();
 }
+// Clicks INSIDE a paused panel must see their result immediately — Dismiss/
+// Undo/Close would otherwise appear to do nothing until the mouse left.
+function forceRender(id) {
+  const fn = pendingRender.get(id);
+  pendingRender.delete(id);
+  if (fn) fn();
+}
 
 // ---- TradingView chart ----
 // The free embed widgets have no runtime setSymbol API; the officially
@@ -268,6 +275,7 @@ function renderSignalHistory(box) {
             class: 'btn ghost small', onclick: async () => {
               await api('/api/signals/dismiss', { method: 'POST', body: { id: s.id, undo: true } });
               await loadSignals();
+              forceRender('signals');
             },
           }, 'Undo')
         : null));
@@ -306,6 +314,7 @@ function renderSignalsNow() {
           class: 'btn ghost', onclick: async () => {
             await api('/api/signals/dismiss', { method: 'POST', body: { id: s.id } });
             await loadSignals();
+            forceRender('signals');
           },
         }, 'Dismiss'),
         srcUrl ? el('a', { class: 'btn ghost', href: srcUrl, target: '_blank', rel: 'noopener' }, 'Source ↗') : null,
@@ -323,6 +332,7 @@ function prefillTicket(s) {
   if (Number.isFinite(s.plan_qty)) document.getElementById('ticket-qty').value = s.plan_qty;
   if (Number.isFinite(s.plan_stop)) document.getElementById('ticket-stop').value = s.plan_stop.toFixed(2);
   if (Number.isFinite(s.plan_target)) document.getElementById('ticket-target').value = s.plan_target.toFixed(2);
+  updateTicketPreview(); // programmatic .value writes fire no input events
 }
 
 async function loadSignals() {
@@ -364,6 +374,11 @@ document.getElementById('place-trade').addEventListener('click', async () => {
   const qty = Number(document.getElementById('ticket-qty').value);
   if (!Number.isFinite(qty) || qty <= 0) { setStatus('Quantity must be a positive number', true); return; }
   const num = (id) => { const v = Number(document.getElementById(id).value); return Number.isFinite(v) && v > 0 ? v : undefined; };
+  // Attribution resolved at PLACE time: the trade only joins to the signal
+  // when the symbols actually match — an emptied input falling back to the
+  // charted symbol must never attribute a different symbol's trade.
+  const sig = signalsCache.find((s) => s.id === activeSignalId);
+  const attributed = sig && sig.tv_symbol === symbol ? sig : null;
   const body = {
     symbol,
     side: document.getElementById('ticket-side').value,
@@ -371,16 +386,16 @@ document.getElementById('place-trade').addEventListener('click', async () => {
     entry_price: num('ticket-entry'),
     stop_price: num('ticket-stop'),
     target_price: num('ticket-target'),
-    signal_id: activeSignalId,
+    signal_id: attributed ? activeSignalId : null,
   };
-  const sig = signalsCache.find((s) => s.id === activeSignalId);
-  if (sig) body.thesis = sig.headline;
+  if (attributed) body.thesis = attributed.headline;
   btn.disabled = true; btn.textContent = 'Placing…';
   try {
     const r = await api('/api/trades', { method: 'POST', body });
     toast(`Opened ${body.side} ${body.qty} ${symbol} @ ${r.entry_price.toFixed(2)} (paper)`, 'open');
     activeSignalId = null;
     for (const id of ['ticket-entry', 'ticket-stop', 'ticket-target']) document.getElementById(id).value = '';
+    updateTicketPreview(); // cleared entry now means market order — say so
     if (typed) loadChart(typed);
     await loadAll();
   } catch (err) {
@@ -578,7 +593,9 @@ function renderBlotterNow(data) {
                 const r = await api('/api/trades/close', { method: 'POST', body: { id: t.id } });
                 setStatus(`Closed ${t.symbol} @ ${r.exit_price.toFixed(2)}`);
                 await loadAll();
-              } catch (err) { setStatus(`Close failed: ${err.message}`); }
+                forceRender('blotter');
+                forceRender('tradelog');
+              } catch (err) { setStatus(`Close failed: ${err.message}`, true); }
             },
           }, 'Close')
         : null),

@@ -194,6 +194,9 @@ const US_HOLIDAYS = new Set([
   '2027-01-01', '2027-01-18', '2027-02-15', '2027-03-26', '2027-05-31', '2027-06-18',
   '2027-07-05', '2027-09-06', '2027-11-25', '2027-12-24',
 ]);
+// NYSE 13:00 ET early closes — without these the afternoon reads as open and
+// fills would book against the frozen 13:00 print for three hours.
+const US_EARLY_CLOSE = new Set(['2026-11-27', '2026-12-24', '2027-11-26']);
 const ET_FMT = new Intl.DateTimeFormat('en-US', {
   timeZone: 'America/New_York', hour12: false,
   weekday: 'short', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
@@ -214,7 +217,8 @@ function etNow(ts = Date.now()) {
 function usMarketOpen(ts = Date.now()) {
   const p = etNow(ts);
   if (p.weekend || US_HOLIDAYS.has(p.day)) return false;
-  return p.minutes >= 9 * 60 + 30 && p.minutes < 16 * 60;
+  const close = US_EARLY_CLOSE.has(p.day) ? 13 * 60 : 16 * 60;
+  return p.minutes >= 9 * 60 + 30 && p.minutes < close;
 }
 const isCrypto = (sym) => sym.endsWith('-USD');
 // Crypto trades around the clock; everything else only during the US session.
@@ -814,8 +818,17 @@ const CLUSTER_LIMITS = [
 ];
 let killSwitchLoggedDay = '';
 function etDayStart(now) {
-  const p = etNow(now);
-  return now - p.minutes * 60000 - (now % 60000);
+  // Wall-clock minute arithmetic is one hour off when a DST transition sits
+  // between midnight and now — correct iteratively until the boundary really
+  // is 00:00 of today's ET calendar day.
+  const today = etNow(now).day;
+  let start = now - etNow(now).minutes * 60000 - (now % 60000);
+  for (let i = 0; i < 3; i++) {
+    const p = etNow(start);
+    if (p.day === today && p.minutes === 0) break;
+    start -= (p.day === today ? p.minutes : p.minutes - 24 * 60) * 60000;
+  }
+  return start;
 }
 // Daily-loss kill switch: a bad enough realized day stops ALL new entries
 // (event, tech, and scalper) until the next ET trading day.
@@ -1702,10 +1715,18 @@ async function getBarsRange(symbol, rangeDays = 365) {
   const have = db.prepare('SELECT COUNT(*) AS c, MIN(ts) AS minTs, MAX(ts) AS maxTs FROM bars WHERE symbol = ?').get(symbol);
   const lastFetch = barsFetchMemo.get(symbol) || 0;
   const wantFrom = Date.now() - rangeDays * 86400000;
-  const needRemote = (Date.now() - lastFetch > 12 * 3600 * 1000 && (!have.maxTs || Date.now() - have.maxTs > 36 * 3600 * 1000))
-    || !have.c || (have.minTs > wantFrom + 30 * 86400000);
+  // Every clause respects a fetch memo — an unsatisfiable freshness condition
+  // (short-history symbol, range the fetch can't cover) must degrade to a
+  // periodic retry, never a refetch on every call.
+  const memoOk = (ms) => Date.now() - lastFetch > ms;
+  const needRemote = (!have.c && memoOk(10 * 60 * 1000))
+    || (memoOk(12 * 3600 * 1000) && (!have.maxTs || Date.now() - have.maxTs > 36 * 3600 * 1000))
+    || (have.c && have.minTs > wantFrom + 30 * 86400000 && memoOk(12 * 3600 * 1000));
   if (needRemote) {
-    const range = rangeDays > 400 ? '2y' : rangeDays > 200 ? '1y' : '6mo';
+    barsFetchMemo.set(symbol, Date.now()); // set at attempt so failures back off too
+    // The fetched range must actually cover wantFrom, or the minTs clause
+    // could never be satisfied.
+    const range = rangeDays > 335 ? '2y' : rangeDays > 170 ? '1y' : '6mo';
     const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=${range}`;
     const data = await fetchJson(url, { Accept: 'application/json' });
     const r = data?.chart?.result?.[0];
@@ -1713,11 +1734,13 @@ async function getBarsRange(symbol, rangeDays = 365) {
     if (q?.close) {
       const ins = db.prepare('INSERT OR REPLACE INTO bars (symbol, ts, o, h, l, c) VALUES (?, ?, ?, ?, ?, ?)');
       for (let i = 0; i < q.close.length; i++) {
+        // Never store the in-progress session's bar as completed history — a
+        // mid-session high/low/close would be served frozen for a day.
+        if (i === q.close.length - 1 && Date.now() - r.timestamp[i] * 1000 < 24 * 3600 * 1000) continue;
         if ([q.open[i], q.high[i], q.low[i], q.close[i]].every(Number.isFinite)) {
           ins.run(symbol, r.timestamp[i] * 1000, q.open[i], q.high[i], q.low[i], q.close[i]);
         }
       }
-      barsFetchMemo.set(symbol, Date.now());
     }
   }
   return db.prepare('SELECT ts, o, h, l, c FROM bars WHERE symbol = ? AND ts >= ? ORDER BY ts').all(symbol, wantFrom);
@@ -1792,21 +1815,31 @@ function simulateTrade(bars, i, direction, variant, rule, symbol, frictionOn = t
   return fin('still open at range end', lastB.c, lastB.ts, true);
 }
 
-// Sequential $100k account per rule: 1% risk sizing on running equity, 15%
-// notional cap — the same arithmetic the live autopilot uses.
+// $100k account per rule: 1% risk sizing, 15% notional cap — like the live
+// autopilot. Trades overlap across symbols, so sizing at open may only see
+// P&L from trades already CLOSED by that moment (no look-ahead), and the
+// equity curve / drawdown are booked in close order (chronological reality).
 function accountSim(trades, base = 100000) {
   const sorted = [...trades].sort((a, b) => a.openedAt - b.openedAt);
-  let equity = base, peak = base, maxDD = 0, wins = 0, grossWin = 0, grossLoss = 0, friction = 0, taken = 0;
-  const curve = [{ ts: sorted.length ? sorted[0].openedAt : Date.now(), balance: base }];
+  const closedSoFar = []; // { ts, pnl } of already-sized trades
+  let friction = 0, taken = 0;
   for (const t of sorted) {
-    let qty = Math.floor((equity * 0.01) / t.stopDist);
-    qty = Math.min(qty, Math.floor((equity * MAX_POSITION_FRACTION) / t.entry));
-    if (qty < 1) { if (t.stopDist <= equity * 0.02) qty = 1; else { t.qty = 0; continue; } }
+    let equityAtOpen = base;
+    for (const c of closedSoFar) if (c.ts <= t.openedAt) equityAtOpen += c.pnl;
+    let qty = Math.floor((equityAtOpen * 0.01) / t.stopDist);
+    qty = Math.min(qty, Math.floor((equityAtOpen * MAX_POSITION_FRACTION) / t.entry));
+    if (qty < 1) { if (t.stopDist <= equityAtOpen * 0.02) qty = 1; else { t.qty = 0; continue; } }
     t.qty = qty;
     t.pnl = t.pnlPerShare * qty;
-    equity += t.pnl;
     friction += t.frictionPerShare * qty;
     taken++;
+    closedSoFar.push({ ts: t.closedAt, pnl: t.pnl });
+  }
+  const seq = sorted.filter((t) => t.qty).sort((a, b) => a.closedAt - b.closedAt);
+  let equity = base, peak = base, maxDD = 0, wins = 0, grossWin = 0, grossLoss = 0;
+  const curve = [{ ts: seq.length ? Math.min(...sorted.filter((t) => t.qty).map((t) => t.openedAt)) : Date.now(), balance: base }];
+  for (const t of seq) {
+    equity += t.pnl;
     if (t.pnl > 0) { wins++; grossWin += t.pnl; } else grossLoss += -t.pnl;
     if (equity > peak) peak = equity;
     if (equity - peak < maxDD) maxDD = equity - peak;
@@ -1816,12 +1849,14 @@ function accountSim(trades, base = 100000) {
   return {
     trades: taken, pnl: equity - base, endEquity: equity,
     winRate: taken ? wins / taken : null,
-    profitFactor: grossLoss > 0 ? grossWin / grossLoss : (grossWin > 0 ? Infinity : null),
+    // 'inf' sentinel: JSON.stringify turns Infinity into null, which would be
+    // indistinguishable from no-data on the client and in stored runs.
+    profitFactor: grossLoss > 0 ? grossWin / grossLoss : (grossWin > 0 ? 'inf' : null),
     maxDrawdown: maxDD,
     frictionPaid: friction,
-    avgHoldDays: taken ? sorted.reduce((s, t) => s + (t.qty ? (t.closedAt - t.openedAt) / 86400000 : 0), 0) / taken : null,
+    avgHoldDays: taken ? seq.reduce((s, t) => s + (t.closedAt - t.openedAt) / 86400000, 0) / taken : null,
     curve: ds,
-    tradeLog: sorted.filter((t) => t.qty).slice(-300).map((t) => ({
+    tradeLog: seq.slice(-300).map((t) => ({
       symbol: t.symbol, side: t.direction, openedAt: t.openedAt, closedAt: t.closedAt,
       entry: +t.entry.toFixed(4), exit: +t.exit.toFixed(4), qty: t.qty, pnl: +t.pnl.toFixed(2), reason: t.reason,
     })),
@@ -1887,13 +1922,24 @@ async function replayRecordedSignals(opts = {}) {
 // Counterfactual scoring for signals the autopilot did NOT take — the cheapest
 // honest answer to "is the gating saving or costing money?"
 async function scoreUntakenSignals() {
+  // Newest first: permanently unscoreable stragglers must never starve fresh
+  // signals out of the LIMITed batch.
   const rows = db.prepare(`SELECT * FROM signals WHERE outcome_pnl IS NULL AND direction IN ('long','short')
-    AND status IN ('expired', 'dismissed', 'skipped') AND created_at < ? LIMIT 15`).all(Date.now() - 3 * 86400000);
+    AND status IN ('expired', 'dismissed', 'skipped') AND created_at < ? ORDER BY created_at DESC LIMIT 15`).all(Date.now() - 3 * 86400000);
   for (const s of rows) {
     try {
-      const bars = await getBarsRange(s.tv_symbol, 90);
+      // Window sized from the signal's age so old signals stay scoreable.
+      const ageDays = Math.ceil((Date.now() - s.created_at) / 86400000) + 40;
+      const bars = await getBarsRange(s.tv_symbol, Math.min(730, Math.max(90, ageDays)));
       let i = bars.findIndex((b) => b.ts > s.created_at) - 1;
-      if (i < 5 || i + 1 >= bars.length) continue;
+      if (i === -2) continue; // no completed bar after the signal yet — retry later
+      if (i < 5) {
+        // Fewer than 5 bars of history before the signal even at an age-sized
+        // window — mark it so the row leaves the queue instead of clogging it.
+        db.prepare("UPDATE signals SET outcome_pnl = 0, outcome_note = 'unscoreable — insufficient bar history' WHERE id = ?").run(s.id);
+        continue;
+      }
+      if (i + 1 >= bars.length) continue; // too recent — next bar not final yet
       const t = simulateTrade(bars, i, s.direction, STRATEGY_VARIANTS.base, s.rule, s.tv_symbol, true);
       if (!t || t.stillOpen) continue;
       const qty = s.plan_qty || Math.max(1, Math.floor(10000 / t.entry));
